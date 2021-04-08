@@ -1,0 +1,120 @@
+---
+title: "Tail Risk Management"
+author: "Lorenzo Lucchese"
+date: "07/03/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(rugarch)
+library(zoo)
+library(kableExtra)
+library(xts)
+library(cowplot)
+library(grid)
+library(gridExtra)
+library(highfrequency)
+```
+
+We carry out a data simulation study to check the CPOT functions are working properly. We first simulate a sample $\boldsymbol{x} = (x_t)_{t=1}^n$ from the model-assumed data generating process with IID covariates $\boldsymbol{RM}_t$ s.t. $RM^{(1)}\sim N(0,1)$, $RM^{(2)}\sim N(0,1)$ independently. 
+We fix  $\boldsymbol{\psi}, \boldsymbol{\nu}, \boldsymbol{\kappa}$ and simulate exceedance indicators $i_t \sim Bernoulli(\text{logit}^{-1}(\boldsymbol{\psi}^T\boldsymbol{RM}_{t-1}))$ and exceedances $x_t - u \sim GPD(\exp(\boldsymbol{\nu}^T\boldsymbol{RM}_{t-1}), \exp(\boldsymbol{\kappa}^T\boldsymbol{RM}_{t-1}))$. For non-exceedances, i.e. $i_t = 0$, we pick an arbitrarily distribution with support in $(-\infty, u)$.
+
+We fit the model using _CPOT_fit()_ and compare the MLEs with the true parameters.
+We also compute the confidence intervals for the parameter estimates using both the closed form asymptotic results (which are applicable since the covaraites are IID) and the bootstrapping technique. We check the two methods yield similar values. All results are displayed in the tables below.
+
+\textbf{Remark} This is also a good starting point for a detailed analysis of the parameter MSEs and the CI widths produced by the C-POT specification.
+
+```{r}
+# Data simulation study
+n <- 5000
+p <- 2
+u <- 0.5
+psi <- c(-5, -1)
+nu <- c(0.1, 0.2)
+kappa <- c(0.05, 0.5)
+RM <- cbind(rnorm(n), rnorm(n, 2))
+pars <- data.frame(psi, nu, kappa)
+
+CPOT_sim <- function(RM, u, pars){
+  #================================================================================
+  # A function which simulates a sample from the CPOT model specification with 
+  # covariates RM.
+  #
+  # INPUTS
+  # RM: model covariates. (n x p)
+  # u: threshold. (1 x 1)
+  # pars: A dataframe with columns psi, nu, kappa. (p x 3)
+  #
+  # OUTPUTS
+  # x: sample from C-POT model. (n x 1)
+  #================================================================================
+  psi <- pars$psi
+  nu <- pars$nu
+  kappa <- pars$kappa
+  
+  # time-varying parameters
+  phi <- exp( RM%*%psi )/(1 + exp( RM%*%psi ))
+  xi <- exp( RM%*%nu )
+  beta <- exp( RM%*%kappa )
+  
+  # initialise sample
+  n <- nrow(RM)
+  x <- rep(0, n)
+  
+  # simulate exceedances
+  i <- (runif(n) < phi)
+  #if exceedance has occured simulate from GPD (upper tail)
+  x[i] <- u + beta[i]/xi[i] * ( exp(xi[i]*rexp(sum(i))) - 1)
+  # if exceedance has not occured simulate from any non parametric distribution
+  # with support on (-infty, u) - alternatively set to 0
+  x[!i] <- runif(sum(!i), u - 2, u) 
+  
+  return(x)
+}
+
+x <- CPOT_sim(RM, u, pars)
+
+# check model fitting 
+C <- CPOT_fit(x, u, RM)
+kable(pars, format = "simple",
+      caption = "True parameters",
+      escape = F, digits = 4)
+rownames(C$pars) <- NULL
+kable(C$pars, format = "simple",
+      caption = "Fitted parameters",
+      escape = F, digits = 4)
+
+```
+
+```{r}
+# Check bootstrapping and asymptotic CIs yield similar values (asymptotically the same)
+
+# Asymptotic confidence intervals
+psi_CI <- data.frame(rbind(C$pars$psi - 1.96*C$pars_se$psi, 
+                           C$pars$psi + 1.96*C$pars_se$psi))
+nu_CI <- data.frame(rbind(C$pars$nu - 1.96*C$pars_se$nu, 
+                          C$pars$nu + 1.96*C$pars_se$nu))
+kappa_CI <- data.frame(rbind(C$pars$kappa - 1.96*C$pars_se$kappa,
+                             C$pars$kappa + 1.96*C$pars_se$kappa))
+CI_df <- cbind(psi_CI, nu_CI, kappa_CI)
+kable(CI_df, format = "simple",
+      caption = "Asymptotic confidence intervals",
+      col.names = c(paste0("psi", c(1:p)), paste0("nu", c(1:p)), 
+                    paste0("kappa", c(1:p))),
+      escape = F, digits = 4)
+
+# Bootstrap confidence intervals
+CI_boot <- data.frame(CPOT_bootstrapCIs(x, u, RM))
+
+kable(CI_boot, format = "simple",
+      col.names = c(paste0("psi", c(1:p)), paste0("nu", c(1:p)), 
+                    paste0("kappa", c(1:p))),
+      caption = "Bootstrap confidence intervals",
+      escape = F, digits = 4)
+
+
+```

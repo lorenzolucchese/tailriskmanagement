@@ -1,0 +1,250 @@
+---
+title: "Data and Stylized facts"
+author: "Lorenzo Lucchese"
+date: "14/02/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(readxl)
+library(zoo)
+library(xts)
+library(forecast)
+library(ggplot2)
+library(cowplot)
+```
+
+## Data and stylized facts
+
+In this thesis we will consider the S&P 500 index from January 2018 to October 2020. The data can be obtained for the SPY ticker (an ETF which tracks the S&P 500 index) from LOBSTER (https://lobsterdata.com/) in the form of high frequency limit order book data. We appropriately preprocess the data to obtain a time series of equidistant high frequency returns by using the code available at https://github.com/lorenzolucchese/LOBSTER-data-processing. These will be used to compute the realised measures in section [add reference]. 
+
+For the moment we focus on daily returns and highlight some important empirical characteristics that can be observed in general financial time series, known as the stylized facts:
+\begin{enumerate}[start=1, label={(\bfseries S\arabic*):}]
+\item Return series are not identically independently distributed although they show little serial correlation.
+\item Series of absolute or squared returns show profound serial correlation.
+\item Conditional expected returns are close to zero.
+\item Volatility appears to vary over time.
+\item Return-series are heavy tailed.
+\item Extreme returns appear in clusters, this phenomenon is known as volatility clustering.
+\end{enumerate}
+
+```{r}
+# Data 
+SPY_preprocessed_data <- read_excel(
+  "C:/Users/Lorenzo/Desktop/Imperial/M4/Thesis/SPY_1min_preprocessed_data.xlsx",
+  col_names = FALSE, col_types = c("date", "numeric"))
+
+corrupted_dates <- c("2019-01-09", "2020-05-26", "2020-06-04", "2020-08-05", "2020-08-10",
+                     "2020-08-18", "2020-09-24", "2020-10-30")
+SPY.HF <- xts(read.zoo(SPY_preprocessed_data))
+# remove corrupted dates
+SPY.HF <- SPY.HF[!(time(SPY.HF) %in% index(SPY.HF[corrupted_dates]))]
+
+# daily returns
+SPY.dailyreturns <- read_excel(
+  "C:/Users/Lorenzo/Desktop/Imperial/M4/Thesis/SPY_daily_log_returns.xlsx",
+  col_names = FALSE, col_types = c("date", "numeric"))
+SPY.dailyreturns <- xts(read.zoo(SPY.dailyreturns))
+# remove corrupted dates
+SPY.dailyreturns <- SPY.dailyreturns[!(index(SPY.dailyreturns) %in%
+                                       index(SPY.dailyreturns[corrupted_dates]))]
+
+head(SPY.dailyreturns)
+
+p <- ggplot(SPY.dailyreturns, aes(x = Index)) + geom_line(aes(y = x)) +
+  ggtitle("SPY daily returns") + ylab("") + xlab("") +
+  theme(plot.title = element_text(hjust = 0.5))
+p
+
+save_plot("Thesis plots/SPYdailyreturns.jpg", p, dpi = 600, limitsize = FALSE)
+```
+
+
+#### (S1) Return series are not identically independently distributed although they show little serial correlation.
+
+```{r}
+# We plot the autocorrelation sequence for the SPY returns (max lag 1 month)
+p <- ggAcf(SPY.dailyreturns, lag.max = 22) + ylim(c(-1, 1)) +
+  ggtitle("Autocorrelation of returns") + 
+  theme(plot.title = element_text(hjust = 0.5))
+p
+save_plot("Thesis plots/S1acvs.jpg", p, dpi = 600, limitsize = FALSE)
+```
+
+#### (S2) Series of absolute or squared returns show profound serial correlation.
+
+```{r}
+# We plot the autocorrelation sequence for the squared SPY returns (max lag 1 month)
+p <- ggAcf(SPY.dailyreturns^2, lag.max = 22) + ylim(c(-1,1)) +
+  ggtitle("Autocorrelation of squared returns") +
+  theme(plot.title = element_text(hjust = 0.5))
+p
+save_plot("Thesis plots/S2acvs.jpg", p, dpi = 600, limitsize = FALSE)
+```
+
+#### (S3) Conditional expected returns are close to zero.
+
+```{r}
+# [elaborate]
+```
+
+
+#### (S4) Volatility appears to vary over time.
+
+```{r}
+# We plot the 1-week rolling volatility.
+
+p <- ggplot(sqrt(rollapply(SPY.dailyreturns^2, 5, mean)), aes(x = Index)) +
+  geom_line(aes(y = x)) + xlab("") + ylab("") + 
+  ggtitle("1 week rolling volatility") +
+  theme(plot.title = element_text(hjust = 0.5))
+p
+
+save_plot("Thesis plots/S4rollvol.jpg", p, dpi = 600, limitsize = FALSE)
+```
+
+
+#### (S5) Return-series are heavy tailed.
+
+```{r}
+# We plot the empirical return density for the whole period. The density of a 
+# normal distribution with fitted mean and standard deviation is plotted for 
+# comparison.
+
+p <- ggplot(SPY.dailyreturns) + 
+  geom_density(aes(x = x, col = "Empirical density"), adjust = 2) +
+  stat_function(fun = dnorm, n = 1001, args = 
+                  list(mean = mean(SPY.dailyreturns), sd = sd(SPY.dailyreturns)),
+                aes(colour = "Normal density")) +
+  coord_cartesian(xlim = c(-0.04, 0.04)) + 
+  xlab("Daily returns") + ylab("") +
+  scale_color_manual(values = c("black", "red")) + 
+  guides(colour = "legend") +
+  ggtitle("Empirical return density") +
+  theme(legend.position = c(0.85,0.8), legend.title = element_blank(), 
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+p 
+p_zoom <- p + coord_cartesian(xlim = c(-0.06, -0.03), ylim = c(0, 2.5)) + 
+  ggtitle("Empirical return density (lower tail)")
+p_zoom
+
+p_QQ <- ggplot(SPY.dailyreturns, aes(sample = x)) + stat_qq() + stat_qq_line() +
+  ggtitle("Normal quantile-quantile plot of returns") +
+  theme(plot.title = element_text(hjust = 0.5))
+p_QQ
+
+p <- plot_grid(p, p_zoom, p_QQ, nrow = 3)
+
+p
+
+save_plot("Thesis plots/S5fattails.jpg", p, nrow = 3, dpi = 600, limitsize = FALSE)
+```
+
+#### (S6) Extreme returns appear in clusters, this phenomenon is known as volatility clustering.
+```{r}
+# We plot only the returns with absolut value bigger than the 95-th quantile
+highquantile <- quantile(abs(SPY.dailyreturns), 0.95)
+SPY.extremereturns <- SPY.dailyreturns[abs(SPY.dailyreturns) > highquantile]
+
+p <- ggplot(SPY.dailyreturns, aes(x = Index)) +
+  geom_line(aes(y = x)) +
+  annotate("point", x = as.POSIXct(index(SPY.extremereturns)), 
+           y = as.numeric(SPY.extremereturns), col = "red") +
+  xlab("") + ylab("") + ggtitle("SPY extreme returns") +
+  theme(plot.title = element_text(hjust = 0.5))
+p
+
+save_plot("Thesis plots/S6clustering.jpg", p, dpi = 600, limitsize = FALSE)
+
+```
+
+
+## Measuring tail risk: VaR and ES
+
+The following plot helps to visualise the concepts of VaR and ES.
+
+```{r}
+alpha <- 0.05
+DF <- 5
+density_df <- data.frame(x = seq(-5, 5, 0.001), 
+                         y = dt(seq(-5, 5, 0.001), df = DF, ncp = 0))
+VaR <- qt(1-alpha, df = DF, ncp = 0)
+ES <- integrate(function(gamma) qt(gamma, df = DF, ncp = 0), 1-alpha, 1)$value / alpha
+p <- ggplot(density_df, aes(x)) + 
+  geom_line(aes(x= x, y= y)) +
+  geom_vline(linetype = "dotdash", xintercept = VaR, col ="darkred") +
+  geom_vline(linetype = "dotdash", xintercept = ES, col = "darkred") +
+  geom_area(data = density_df[density_df$x > VaR,], aes(y = y), alpha = 0.2) +
+  coord_cartesian(c(-2, 4)) + xlab("Loss distribution, L = -Y") + ylab("") +
+  ggtitle("VaR and ES visualised") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = VaR, y = -0.01, 
+             label = paste0(round(100*(1-alpha)),"% VaR")) +
+  annotate("text", x = ES, y = -0.01, label = paste0(round(100*(1-alpha)),"% ES")) 
+
+p
+
+save_plot("Thesis plots/VaRES.jpg", p, dpi = 600, limitsize = FALSE)
+```
+
+### Shortcomings of VaR and ES
+
+Different tails given rise to the same (VaR, ES) couple.
+
+```{r}
+# We use alpha and (VaR, ES) from the previous distribution
+
+# slowly decaying tail: (1+x)^-alpha
+gamma <- 2 + 1/(ES-VaR)
+
+# exponentially decaying tail: exp(-beta*x)
+beta <- 1/(ES-VaR)
+
+# finite support tail (1+xi*x)^(-1-1/xi), for x <= -1/xi and xi < 0
+xi <- 1 - 1/(ES-VaR)
+
+x <- seq(VaR - 1, -1/xi + 0.5, 0.001)
+tails_df <- data.frame(x, slow.tail <- alpha/(gamma-2)*(1+x)^(-gamma),
+                       exp.tail <- alpha*beta*exp(-beta*x),
+                       finite.tail <- c(alpha*(1+xi*x[x<(-1/xi)])^(-1-1/xi), 
+                                        rep(0, sum(x>=(-1/xi)))))
+
+p <- ggplot(tails_df, aes(x = x)) +
+  geom_line(aes(y = slow.tail, linetype = "Slowly varying")) +
+  geom_line(aes(y = exp.tail, linetype = "Exponential")) +
+  geom_line(aes(y = finite.tail, linetype = "Finite support")) + 
+  geom_vline(xintercept = VaR, linetype = "dotdash", col = "darkred") +
+  geom_vline(xintercept = ES, linetype = "dotdash", col = "darkred") +
+  ggtitle("Different tails, same VaR and ES") +
+  theme(legend.position = c(0.8, 0.8), plot.title = element_text(hjust = 0.5)) + 
+  coord_cartesian(xlim = c(VaR - 0.5, -1/xi+0.5), ylim = c(0, 0.0075)) +
+  scale_linetype_manual("Tail behaviour", 
+                        breaks = c("Slowly varying", "Exponential", 
+                                   "Finite support"),
+                        values = c("dashed", "longdash", "solid")) + 
+  ylab("") + xlab("Loss distribution, L = -Y") +
+  annotate("text", x = VaR, y = 0, 
+             label = paste0(round(100*(1-alpha)),"% VaR")) +
+  annotate("text", x = ES, y = 0, label = paste0(round(100*(1-alpha)),"% ES")) 
+
+p
+
+p_zoom <- p + coord_cartesian(xlim = c(4, -1/xi+0.5), ylim = c(0, 0.001)) +
+  ggtitle("Different tails, same VaR and ES (zoomed)") + 
+  theme(legend.position = "none")
+
+p <- plot_grid(p, p_zoom, nrow = 2)
+
+p
+
+save_plot("Thesis plots/VaRESshortcomings.jpg", p, nrow = 2, dpi = 600, limitsize = FALSE)
+```
+

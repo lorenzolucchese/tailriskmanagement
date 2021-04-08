@@ -1,0 +1,2512 @@
+---
+title: "Tail Risk Management"
+author: "Lorenzo Lucchese"
+date: "07/03/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(rugarch)
+library(zoo)
+library(kableExtra)
+library(xts)
+library(cowplot)
+library(grid)
+library(gridExtra)
+library(highfrequency)
+```
+
+## Data
+
+Load data for empirical analysis.
+
+```{r}
+# Data 
+SPY_preprocessed_data <- read_excel(
+  "C:/Users/Lorenzo/Desktop/Imperial/M4/Thesis/SPY_1min_preprocessed_data.xlsx",
+  col_names = FALSE, col_types = c("date", "numeric"))
+
+corrupted_dates <- c("2019-01-09", "2020-05-26", "2020-06-04", "2020-08-05", "2020-08-10",
+                     "2020-08-18", "2020-09-24", "2020-10-30")
+SPY.HF <- xts(read.zoo(SPY_preprocessed_data))
+# remove corrupted dates
+SPY.HF <- SPY.HF[!(time(SPY.HF) %in% index(SPY.HF[corrupted_dates]))]
+
+# daily returns
+SPY.dailyreturns <- read_excel(
+  "C:/Users/Lorenzo/Desktop/Imperial/M4/Thesis/SPY_daily_log_returns.xlsx",
+  col_names = FALSE, col_types = c("date", "numeric"))
+SPY.dailyreturns <- xts(read.zoo(SPY.dailyreturns))
+# remove corrupted dates
+SPY.dailyreturns <- SPY.dailyreturns[!(index(SPY.dailyreturns) %in%
+                                       index(SPY.dailyreturns[corrupted_dates]))]
+
+# discard first month of daily returns
+SPY.dailyreturns <- tail(SPY.dailyreturns, -21)
+
+```
+
+
+## IID POT model
+
+Let $X_1,\ldots,X_n$ be a set of independent, identically distributed random variables with common distribution $F$. Motivated by the Pickands-Balkema-de Haan theorem we model the tail of $F$ for $x\geq u$ by
+\[
+	1- F(x) = \phi \Big(1 + \xi \frac{x-u}{\beta}\Big)^{-\frac{1}{\xi}}
+\]
+for $\phi = \mathbb{P}(X\geq u)$. This is equivalent to assuming that $X|X>u$ follows a $G_{\xi,\beta}$ distribution with support on $(u,\infty)$. 
+
+For a sample $x_1, \ldots, x_n$ the MLEs are given by:
+\begin{align*}
+	\hat\phi &= \frac{n_u}{n} \text{ where } n_u=\sum_{t=1}^n i(x_t) \\
+	(\hat\xi,\hat\beta) &= \underset{(\xi,\beta)\in \Xi\times B}{\text{argmax}} \frac{1}{n}  \sum_{t=1}^n \bigg\{i(x_t)\log(g_{\xi,\beta}(x_t-u))\bigg\} 
+\end{align*}
+where $i(x_t)=1_{\{x_t>u\}}$.
+
+```{r}
+GPD_loglikelihood <- function(x, xi, beta){
+  #================================================================================
+  # A function which computes the log-likelihood of a sample from a GPD distribution 
+  # with shape and scale parameters xi and beta.
+  #
+  # INPUTS
+  # x: the IID GPD sample. (n x 1)
+  # xi: the shape of the GPD distribution. (1 x 1)
+  # beta: the scale of the GPD distribution. (1 x 1)
+  #
+  # OUTPUTS
+  # loglik: the log likelihood evaluated at x. (1 x 1)
+  #================================================================================
+  if(beta <= 0) loglik <- -Inf
+  if(xi > 0) loglik <- sum((-1/xi-1)*log(1 + xi*x/beta) - log(beta))
+  if(xi < 0){
+    if(any(x > - beta/xi)){
+      loglik <- -Inf
+      }
+    else{
+      loglik <- sum((-1/xi-1)*log(1 + xi*x/beta) - log(beta))
+    }
+  }
+  if(xi==0) loglik <- sum(-x/beta - log(beta))
+  return(loglik)
+}
+
+IID_POT_fit <- function(x, u){
+  #================================================================================
+  # A function which fits the IID POT model to the sample x above the specified 
+  # threshold u. The MLE estimators for xi, beta and phi are computed and returned 
+  # in a list along with their asymptotic standard errors.
+  #
+  # INPUTS
+  # x: the IID sample of data. (n x 1)
+  # u: the threshold u above which to fit the GPD distribution. (1 x 1)
+  #
+  # OUTPUTS
+  # POT_fit: a list with named components:
+  #          pars: a dataframe with named columns phi, xi, beta corresponding to the  
+  #                computed MLEs. (1 x 3)
+  #          pars_sd: a dataframe with named columns phi_se, xi_se, beta_se corresponding 
+  #                   to the asymptotic standard errors of the MLEs when xi > 0. 
+  #                   (1 x 3)
+  #          xibeta_varcov: asymptotic variance covariance matrix for the xi and beta 
+  #                         MLEs. (2 x 2)
+  #================================================================================
+  n <- length(x)
+  
+  # if there are not enough exceedances to fit a GPD distribution return error
+  if(sum(x>u) <= 2) stop("Too few exceedances: lower threshold u")
+  
+  # compute MLE and standard error for threshold exceedance probability phi
+  i <- as.numeric(x > u)
+  phi <- mean(i)
+  phi_se <- sqrt(phi*(1-phi)/n)
+  
+  # compute MLE and standard error for GPD distribution on exceedances
+  xi_beta <- optim(c(0, 1), 
+                   function(pars) - GPD_loglikelihood(x[x>u] - u, pars[1], pars[2]))
+  xi <- xi_beta$par[1]
+  beta <- xi_beta$par[2]
+  
+  # if asymptotic normality holds, i.e. 0<xi<1, compute the standard errors
+  if(xi>0){
+    J <- 1/((2*xi+1)*(xi+1)*beta^2) * matrix(c(2*beta^2, beta, beta, 1+xi), 
+                                             nrow = 2)
+    varcov <- solve(J)/sum(i)
+    xi_se <- sqrt(varcov[1,1])
+    beta_se <- sqrt(varcov[2,2])
+  }
+  else{
+    varcov <- NA
+    xi_se <- NA
+    beta_se <- NA
+  }
+  
+  # return fitted parameters
+  return(list(pars = data.frame(phi, xi, beta),
+              pars_se = data.frame(phi_se, xi_se, beta_se),
+              xibeta_varcov = varcov))
+}
+
+```
+
+## C-POT model
+We model the tails of the time series $\{X_t, t\in\mathbb{Z}\}$ conditional on the filtration $(\mathcal{F}_t)_t$ by:
+\begin{align*}
+	\mathbb{P}(X_t>x|\mathcal{F}_{t-1}) &= \mathbb{P}(X_t>x|X_t\geq u, \mathcal{F}_{t-1})\mathbb{P}(X_t\geq u|\mathcal{F}_{t-1}) = \\
+	& = (1-F^u_{t|t-1}(x-u))(1-F_{t|t-1}(u)) = \\
+	& \approx \phi_{t|t-1} \Big(1 + \xi_{t|t-1} \frac{x-u}{\beta_{t|t-1}}\Big)^{-1/\xi_{t|t-1}}.
+\end{align*}
+
+We specify separate dynamic models for $\phi_{t|t-1}$ and GPD parameters $\xi_{t|t-1},\beta_{t|t-1}$:
+\begin{itemize}
+	\item We consider a Logit Binomial GLM for the exceedances, $I_t=1_{\{X_t\geq u\}}$, with covariates $\boldsymbol{RM}_{t-1}$:
+	\begin{align*}
+		\mathbb{P}(I_t=i|\mathcal{F}_{t-1}) &= \phi_{t|t-1}^i(1-\phi_{t|t-1})^{1-i} \qquad i\in\{0,1\}\\
+		\phi_{t|t-1} &= \textrm{logit}^{-1}(\boldsymbol{\psi}^T\boldsymbol{RM}_{t-1})
+	\end{align*}
+	i.e. $I_t|\mathcal{F}_{t-1}\sim Bernoulli(\phi_{t|t-1})$ where $\boldsymbol{\psi} = [\psi_0,\psi_1,\ldots, \psi_p]$ and $\boldsymbol{RM}_{t-1} = [1,RM_{t-1}^1,\ldots, RM_{t-1}^p]$.
+	
+	\item We model $F^u_{t|t-1}$ as a GPD distribution with time varying shape and scale parameters 
+	\begin{align*}
+		\xi_{t|t-1} &= \exp(\boldsymbol{RM}_{t-1}^T\boldsymbol{\nu}) \\
+		\beta_{t|t-1} &= \exp(\boldsymbol{RM}_{t-1}^T\boldsymbol{\kappa})
+	\end{align*}
+	where $\boldsymbol{\nu} = [\nu_0,\nu_1,\ldots, \nu_p]$, $\boldsymbol{\kappa} = [\kappa_0,\kappa_1,\ldots, \kappa_p]$ and $\boldsymbol{RM}_{t-1} = [1,RM_{t-1}^1,\ldots, RM_{t-1}^p]$. Here we are hence modelling $X_t-u|\mathcal{F}_{t-1},I_t=1$ as a GPD distribution with parameters $\xi_{t|t-1}$ and $\beta_{t|t-1}$.
+\end{itemize}
+
+The MLEs for the parameters are given by:
+\begin{align*}
+	\boldsymbol{\hat\psi} &=  \underset{\boldsymbol{\psi}\in \Psi}{\text{argmax}} \frac{1}{n} \sum_{t=1}^n\bigg\{ i_t\log\big(\textrm{logit}^{-1}(\boldsymbol{\psi^T\boldsymbol{RM}_{t-1}})\big) + (1-i_t)\log\big(1-\textrm{logit}^{-1}(\boldsymbol{\psi}^T\boldsymbol{RM}_{t-1})\big)\bigg\}\\
+	(\boldsymbol{\hat\nu},\boldsymbol{\hat\kappa}) &= \underset{(\boldsymbol{\nu},\boldsymbol{\kappa})\in N\times K}{\text{argmax}} \frac{1}{n} \sum_{t=1}^n \bigg\{i_t \log\Big(g_{\exp\{\boldsymbol{\nu}^T\boldsymbol{RM}_{t-1}\}), \exp\{\boldsymbol{\kappa}^T\boldsymbol{RM}_{t-1}\}}(x_t)\Big)\bigg\}
+\end{align*}
+We note that the first estimator is the MLE of a Binomial GLM with logit link function.
+
+
+```{r}
+GPD_loglikelihood_CPOT <- function(x, RM, nu, kappa){
+  #================================================================================
+  # A function which computes the log-likelihood of a sample from a GPD distribution 
+  # with shapes and scales depending on the covariates RM through:
+  # xi[i] = exp( RM[i,]^T nu ) and beta[i] = exp( RM[i,]^T kappa  )
+  #
+  # INPUTS
+  # x: the GPD sample. (n x 1)
+  # RM: the covariates matrix (xi[i], beta[i] will be "regressed" on RM[i,]). (n x p)
+  # nu: the parameters determining the shape of the GPD distribution. (p x 1)
+  # kappa: the parameters determining the scale of the GPD distribution. (p x 1)
+  #
+  # OUTPUTS
+  # loglik: the log likelihood evaluated at x. (1 x 1)
+  #================================================================================
+  xi <- exp( RM %*% nu )
+  beta <- exp( RM %*% kappa )
+  # by specification of xi and beta we have xi, beta > 0
+  loglik <- sum((-1/xi-1)*log(1+xi*x/beta) - log(beta))
+  return(loglik)
+}
+
+GPD_loglikelihood_CPOT_gr <- function(x, RM, nu, kappa){
+  #================================================================================
+  # A function which computes the gradient of the log-likelihood of a sample from a 
+  # GPD distribution with shapes and scales depending on the covariates RM through:
+  # xi = exp( RM[t,]^T nu ) and beta = exp( RM[t,]^T kappa  )
+  #
+  # INPUTS
+  # x: the GPD sample. (n x 1)
+  # RM: the covariates matrix (x[t] will be "regressed" on RM[t,]). (n x p)
+  # nu: the parameters determining the shape of the GPD distribution. (p x 1)
+  # kappa: the parameters determining the scale of the GPD distribution. (p x 1)
+  #
+  # OUTPUTS
+  # loglik_gr: the log likelihood evaluated at x. (1 x 1)
+  #================================================================================
+  xi <- exp( RM %*% nu )
+  beta <- exp( RM %*% kappa )
+  # by specification of xi and beta we have xi, beta > 0, the derivatives are given by:
+  grad_loglik_nu <- t(1/xi*log(1 + xi/beta * x) - (xi + 1) * x/(beta + xi*x))%*%RM
+  grad_loglik_kappa <- t( (xi + 1) * x / (beta + xi * x) - 1 )%*%RM
+  loglik_gr <- c(grad_loglik_nu, grad_loglik_kappa)
+  return(loglik_gr)
+}
+
+
+CPOT_fit <- function(x, u, RM, IID.covariates = TRUE){
+  #================================================================================
+  # A function which fits the C-POT model to the sample x above the specified 
+  # threshold u with covariates RM. The MLE estimators for psi, nu and kappa are 
+  # computed. If IID.covariates = TRUE (default) the asymptotic standard errors 
+  # for the parameters are computed, along with the asymptotic variance covariance
+  # matrix for the nu, kappa MLEs
+  #
+  # INPUTS
+  # x: the data sample. (n x 1)
+  # RM: the covariates matrix (x[i] will be "regressed" on RM[i,]). (n x p)
+  # u: the threshold u above which to fit the GPD distribution. (1 x 1)
+  # IID.covariates: logical indicating whether the covariates can be treated as IID.
+  #
+  # OUTPUTS
+  # CPOT_fit: a list with named components:
+  #           pars: a dataframe with columns psi, nu, kappa corresponding to the 
+  #                 compute MLEs. (p x 3)
+  #           pars_sd: a dataframe with columns psi_se, nu_se, kappa_se corresponding 
+  #                    to the asymptotic standard errors of the MLEs when covariates
+  #                    are IID. (p x 3)
+  #           nukappa_varcov: asymptotic variance covariance matrix for the nu and 
+  #                           kappa MLEs when the covariates are IID. (2p x 2p)
+  #================================================================================
+  n <- length(x)
+  p <- ncol(RM)
+  
+  # if there are not enough exceedances to fit a GPD distribution return error
+  if(sum(x>u) <= 2) stop("Too few exceedances: lower threshold u")
+  
+  # compute MLE for psi using glm function
+  i <- as.numeric(x > u)
+  logitGLM_data <- data.frame(i, RM)
+  logitGLM <- summary(glm(i ~ 0 + ., family=binomial(link="logit"), data = logitGLM_data))
+  psi <- logitGLM$coefficients[,1]
+  
+  # compute MLE and standard error for GPD distribution on exceedances
+  nu_kappa <- optim(rep(0, (2*p)), 
+                   fn = function(pars) 
+                     - GPD_loglikelihood_CPOT(x[x>u] - u, RM[(x>u),], pars[1:p], 
+                                              pars[(p+1):(2*p)]),
+                   gr = function(pars) 
+                     - GPD_loglikelihood_CPOT_gr(x[x>u] - u, RM[(x>u),], pars[1:p],
+                                                 pars[(p+1):(2*p)]))
+  nu <- nu_kappa$par[1:p]
+  kappa <- nu_kappa$par[(p+1):(2*p)]
+  
+  # if the regressors RM are IID compute the analytic asymptotic standard errors
+  if(IID.covariates){
+    # for psi
+    psi_se <- logitGLM$coefficients[,2]
+    
+    # for nu, kappa
+    xi <- exp( RM %*% nu)
+    J <- 0
+    for(t in which(x>u)){
+      M <- matrix(rep(0, (2*p)^2), nrow = (2*p))
+      M[1:p, 1:p] <- 2 * xi[t]^2 * RM[t,]%*%t(RM[t,])
+      M[1:p, (p+1): (2*p)] <- xi[t] * RM[t,]%*%t(RM[t,])
+      M[(p+1):(2*p), 1:p] <- xi[t] * RM[t,]%*%t(RM[t,])
+      M[(p+1):(2*p), (p+1):(2*p)] <- (xi[t] + 1) * RM[t,]%*%t(RM[t,])
+      M <- 1/((xi[t]+1) * (2*x[t]+1) * sum(i)) * M
+      J <- J +  M
+    }
+
+    # asymptotic sd of xi.hat, kappa.hat
+    varcov <- solve(sum(i) * J)
+    nu_se <- sqrt(diag(varcov))[1:p]
+    kappa_se <- sqrt(diag(varcov))[(p+1):(2*p)]
+  }
+  # if the covariates cannot be taken as IID
+  else{
+    # do not compute standard errors
+    psi_se <- NA
+    nu_se <- NA
+    kappa_se <- NA
+    varcov <- NA
+  }
+  
+  
+  # return results
+  return(list(pars = data.frame(psi, nu, kappa),
+              pars_se = data.frame(psi_se, nu_se, kappa_se),
+              nukappa_varcov = varcov))
+  
+}
+
+```
+
+```{r}
+CPOT_bootstrap <- function(x, u, RM, pars){
+  #================================================================================
+  # A function which creates a bootstrap resample of the data for fitted values of 
+  # the parameters psi, nu, kappa.
+  # 
+  # INPUTS
+  # x: the original data sample. (n x 1)
+  # u: the C-POT threshold. (1 x 1)
+  # RM: the C-POT covariates. (n x p)
+  # pars: the fitted parameters, a dataframe with columns psi, nu, kappa. (p x 3)
+  #
+  # OUTPUTS
+  # x_: a resample of the data via bootstrap. (n x 1)
+  #================================================================================
+  psi <- pars$psi
+  nu <- pars$nu
+  kappa <- pars$kappa
+  
+  # fitted parameters
+  phi <- exp( RM%*%psi )/(1 + exp( RM%*%psi ))
+  xi <- exp( RM%*%nu )
+  beta <- exp( RM%*%kappa )
+  
+  # compute exceedence residuals
+  r <- 1/xi[x>u] * log(1 + xi[x>u]/beta[x>u] * (x[x>u]-u) )
+  
+  n <- nrow(RM)
+  x_ <- rep(0, n)
+  
+  # simulate exceedances
+  i <- (runif(n) < phi )
+  # if exceedance has occured simulate exceedance residual and post-blacken
+  x_[i] <- u + beta[i]/xi[i] * ( exp(xi[i]*sample(r, sum(i), replace = TRUE)) - 1)
+  # if exceedance has not occured simulate from the empirical distribution 
+  # function of values below u
+  x_[!i] <- sample(x[x<=u], sum(!i), replace = TRUE) 
+  
+  return(x_)
+}
+
+CPOT_bootstrapCIs <- function(x, u, RM, conf.level = 0.95, boot = 500){
+  #================================================================================
+  # A function which computes the bootstrap confidence intervals for the parameters 
+  # of the C-POT model with data x and covariates RM.
+  # 
+  # INPUTS
+  # x: the original data sample. (n x 1)
+  # u: the C-POT threshold. (1 x 1)
+  # RM: the C-POT covariates. (n x p)
+  # conf.level: the confidence level of the CIs. (1 x 1)
+  # boot: number of bootrap samples to use. (1 x 1)
+  #
+  # OUTPUTS
+  # pars_CIs: a list with named components:
+  #           psi, nu, kappa: dataframes containing the CIs (2 x p).
+  #================================================================================
+  # fit the model
+  pars <- CPOT_fit(x, u, RM, IID.covariates = FALSE)$pars
+  p <- ncol(RM)
+  
+  # initialise matrices to contain bootstrap samples (each row corresponds to a new sample)
+  psi_boot <- matrix(rep(0, p*boot), nrow = boot)
+  kappa_boot <- matrix(rep(0, p*boot), nrow = boot)
+  nu_boot <- matrix(rep(0, p*boot), nrow = boot)
+  
+  for(b in 1:boot){
+    # form a new bootstrap sample
+    x_ <- CPOT_bootstrap(x, u, RM, pars)
+    
+    # fit the model to the new sample
+    pars_boot <- CPOT_fit(x_, u, RM, IID.covariates = FALSE)$pars
+    
+    # retain the fitted parameters
+    psi_boot[b,] <- pars_boot$psi
+    nu_boot[b,] <- pars_boot$nu
+    kappa_boot[b,] <- pars_boot$kappa
+  }
+  
+  # probability
+  alpha <- 1 - conf.level
+  
+  # compute the confidence intervals using the empirical distribution for the parameters
+  # obtain through bootstrapping
+  psi_CI <- apply(psi_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  nu_CI <- apply(nu_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  kappa_CI <- apply(kappa_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  
+  # return the bootstrap confidence intervals
+  return(list(psi_CI = psi_CI, nu_CI = nu_CI, kappa_CI = kappa_CI))
+}
+```
+
+We carry out a data simulation study to check the functions are working properly. We first simulate a sample $\boldsymbol{x} = (x_t)_{t=1}^n$ from the model-assumed data generating process with IID covariates $\boldsymbol{RM}_t$ s.t. $RM^{(1)}\sim N(0,1)$, $RM^{(2)}\sim N(0,1)$ independently. 
+We fix  $\boldsymbol{\psi}, \boldsymbol{\nu}, \boldsymbol{\kappa}$ and simulate exceedance indicators $i_t \sim Bernoulli(\text{logit}^{-1}(\boldsymbol{\psi}^T\boldsymbol{RM}_{t-1}))$ and exceedances $x_t - u \sim GPD(\exp(\boldsymbol{\nu}^T\boldsymbol{RM}_{t-1}), \exp(\boldsymbol{\kappa}^T\boldsymbol{RM}_{t-1}))$. For non-exceedances, i.e. $i_t = 0$, we pick an arbitrarily distribution with support in $(-\infty, u)$.
+
+We fit the model using _CPOT_fit()_ and compare the MLEs with the true parameters.
+We also compute the confidence intervals for the parameter estimates using both the closed form asymptotic results (which are applicable since the covaraites are IID) and the bootstrapping technique. We check the two methods yield similar values. All results are displayed in the tables below.
+
+```{r}
+# Data simultaion study
+n <- 5000
+p <- 2
+u <- 0.5
+psi <- c(-5, -1)
+nu <- c(0.1, 0.2)
+kappa <- c(0.05, 0.5)
+RM <- cbind(rnorm(n), rnorm(n, 2))
+pars <- data.frame(psi, nu, kappa)
+
+CPOT_sim <- function(RM, u, pars){
+  #================================================================================
+  # A function which simulates a sample from the CPOT model specification with 
+  # covariates RM.
+  #
+  # INPUTS
+  # RM: model covariates. (n x p)
+  # u: threshold. (1 x 1)
+  # pars: A dataframe with columns psi, nu, kappa. (p x 3)
+  #
+  # OUTPUTS
+  # x: sample from C-POT model. (n x 1)
+  #================================================================================
+  psi <- pars$psi
+  nu <- pars$nu
+  kappa <- pars$kappa
+  
+  # time-varying parameters
+  phi <- exp( RM%*%psi )/(1 + exp( RM%*%psi ))
+  xi <- exp( RM%*%nu )
+  beta <- exp( RM%*%kappa )
+  
+  # initialise sample
+  n <- nrow(RM)
+  x <- rep(0, n)
+  
+  # simulate exceedances
+  i <- (runif(n) < phi)
+  #if exceedance has occured simulate from GPD (upper tail)
+  x[i] <- u + beta[i]/xi[i] * ( exp(xi[i]*rexp(sum(i))) - 1)
+  # if exceedance has not occured simulate from any non parametric distribution
+  # with support on (-infty, u) - alternatively set to 0
+  x[!i] <- runif(sum(!i), u - 2, u) 
+  
+  return(x)
+}
+
+x <- CPOT_sim(RM, u, pars)
+
+# check model fitting 
+C <- CPOT_fit(x, u, RM)
+kable(pars, format = "simple",
+      caption = "True parameters",
+      escape = F, digits = 4)
+rownames(C$pars) <- NULL
+kable(C$pars, format = "simple",
+      caption = "Fitted parameters",
+      escape = F, digits = 4)
+
+```
+
+```{r}
+# Check bootstrapping and asymptotic CIs yield similar values (asymptotically the same)
+
+# Asymptotic confidence intervals
+psi_CI <- data.frame(rbind(C$pars$psi - 1.96*C$pars_se$psi, 
+                           C$pars$psi + 1.96*C$pars_se$psi))
+nu_CI <- data.frame(rbind(C$pars$nu - 1.96*C$pars_se$nu, 
+                          C$pars$nu + 1.96*C$pars_se$nu))
+kappa_CI <- data.frame(rbind(C$pars$kappa - 1.96*C$pars_se$kappa,
+                             C$pars$kappa + 1.96*C$pars_se$kappa))
+CI_df <- cbind(psi_CI, nu_CI, kappa_CI)
+kable(CI_df, format = "simple",
+      caption = "Asymptotic confidence intervals",
+      col.names = c(paste0("psi", c(1:p)), paste0("nu", c(1:p)), 
+                    paste0("kappa", c(1:p))),
+      escape = F, digits = 4)
+
+# Bootstrap confidence intervals
+CI_boot <- data.frame(CPOT_bootstrapCIs(x, u, RM))
+
+kable(CI_boot, format = "simple",
+      col.names = c(paste0("psi", c(1:p)), paste0("nu", c(1:p)), 
+                    paste0("kappa", c(1:p))),
+      caption = "Bootstrap confidence intervals",
+      escape = F, digits = 4)
+
+
+```
+
+## C-EVT model
+
+The return process $\{Y_t,\ t\in \mathbb{Z}\}$ is assumed to follow a GARCH($p,q$) process, i.e. it is a strictly stationary process s.t. for (strictly positive) $\{\sigma_t,\ t\in \mathbb{Z}\}$:
+\begin{align*}
+	Y_t &= \sigma_tZ_t\\
+	\sigma^2_t &= \alpha_0 + \sum_{i=1}^{p} \alpha_i Y^2_{t-i} + \sum_{i=1}^{q} \beta_j \sigma^2_{t-j}
+\end{align*}
+where $\alpha_0>0, \alpha_i\geq0, \beta_j\geq0,\ i=1,\ldots,p,\ j=1,\ldots, q$ and $Z_t\sim SWN(0,1)$.
+We assume the tail of the negated residuals, i.e. $-Z$, above a fixed threshold $u$ follows a GPD with parameters $\xi$, $\beta$ and has threshold exceedance probability $\mathbb{P}(-Z\geq u) = \phi$.
+
+```{r}
+# C-EVT model
+
+CEVT_fit <- function(y, thresh = 0.9, p.GARCH = 1, q.GARCH = 1){
+  #================================================================================
+  # A function which fits the C-EVT model to the return data y, i.e. a GARCH model with 
+  # order p.GARCH, q.GARCH is fitted to the data, then an IID POT model is fitted to the 
+  # lower tail of the standardised residuals.
+  #
+  # INPUTS
+  # y: the return data. (n x 1)
+  # thresh: the quantile above which to fit the POT model to the residuals. (1 x 1)
+  # p.GARCH, q.GARCH: the orders of the GARCH model. (1 x 1)
+  #
+  # OUTPUTS
+  # fit: a list with named components:
+  #     y: the return data. (n x 1)
+  #     CEVT.pars: the hyperparameters of the C-EVT model: thresh, q.GARCH, p.GARCH. (1 x 3)
+  #     GARCH.fit: A uGARCHfit object containing details of the GARCH fit.
+  #     sigma: the vector of fitted conditional volatilities. (n x 1)
+  #     u: the threshold used for the POT on the residuals. (n x 1)
+  #     tail.pars: a dataframe with named columns phi, xi, beta, the estimated
+  #                (lower) tail parameters of the innovation distribution. (1 x 3)
+  #================================================================================
+  # fit GARCH model via quasi maximum likelihood
+  fit.spec <- ugarchspec(variance.model =  
+                           list(model = "sGARCH", garchOrder = c(p.GARCH, q.GARCH)),
+                         mean.model =  list(armaOrder = c(0, 0), include.mean = FALSE),
+                         distribution.model = "norm")
+  GARCH.fit <- ugarchfit(y, spec = fit.spec)
+  # extract the conditional volatilities
+  sigma <- sigma(GARCH.fit)
+  # compute the negated residuals and fit the IID POT model to these
+  z <- y/sigma
+  x <- -z
+  u <- quantile(x, thresh)
+  fit.POT <- IID_POT_fit(x, u)
+  # extract the tail parameters
+  tail.pars <- fit.POT$pars
+  return(list(y= y, 
+              CEVT.pars = data.frame(thresh = thresh, q.GARCH = q.GARCH, p.GARCH = p.GARCH),
+              GARCH.fit = GARCH.fit, 
+              u = u, 
+              sigma = sigma, 
+              tail.pars = tail.pars))
+}
+
+CEVT_bootstrap <- function(CEVT.fit){
+  #================================================================================
+  # A function which creates a bootstrap resample for the C-EVT model using block 
+  # resampling of the residuals.
+  #
+  # INPUTS
+  # CEVT.fit: a list with named components y, CEVT.pars, GARCH.fit, u, sigma, 
+  #           tail.pars as returned by the CEVT_fit() function.
+  #
+  # OUTPUTS
+  # y_ : a resample of the data. (n x 1)
+  #================================================================================
+  # retrieve standardized residuals from GARCH.fit
+  res <- residuals(CEVT.fit$GARCH.fit, standardize = TRUE)
+  sigma <- CEVT.fit$sigma
+    
+  n <- length(res)
+  
+  # divide residuals into blocks of length l
+  l <- floor(n^0.5)
+  blocks <- matrix(rep(0, n*l), nrow = n)
+  res.wrap <- c(res, res[1:(l-1)])
+  for(i in 1:n){
+    blocks[i,] <- res.wrap[i:(i+l-1)]
+  }
+  
+  # resample residuals
+  resample <- sample(1:n, ceiling(n/l), replace = TRUE)
+  res_ <- c()
+  for(j in 1:ceiling(n/l)){
+    res_ <- c(res_, blocks[resample[j],])
+  }
+  res_ <- res_[1:n]
+  
+  # post-blacken residuals
+  y_ <- sigma * res_
+  
+  return(y_)
+  
+}
+
+CEVT_bootstrapCIs <- function(CEVT.fit, conf.level = 0.95, boot = 500){
+  #================================================================================
+  # A function which computes the bootstrap confidence intervals for the parameters 
+  # of the CEVT model.
+  # 
+  # INPUTS
+  # CEVT.fit: a list with named components y, CEVT.pars, GARCH.fit, u, sigma, 
+  #           tail.pars as returned by the CEVT_fit() function.
+  #
+  # OUTPUTS
+  # pars_CIs: a list with named components:
+  #           xi_CI, beta_CI, GARCH.pars_CI: dataframes containing the CIs.
+  #================================================================================
+  # initialise matrices to contain bootstrap samples (each row corresponds to a new sample)
+  xi_boot <- c()
+  beta_boot <- c()
+  GARCH.pars_boot <- c()
+  
+  b <- 0
+  suppressWarnings({
+      while(b < boot){
+        # form a new bootstrap sample
+        y_ <- CEVT_bootstrap(CEVT.fit)
+    
+        # fit the HAR-EVT model to the new sample
+        flag <- FALSE
+        tryCatch(CEVT.boot <- CEVT_fit(y_, thresh = CEVT.fit$CEVT.pars$thresh,
+                              q.GARCH = CEVT.fit$CEVT.pars$q.GARCH,
+                              p.GARCH = CEVT.fit$CEVT.pars$p.GARCH), 
+                 error = function(e) flag <- TRUE)
+        if(flag) next
+    
+        # retain the fitted parameters
+        xi_boot <- c(xi_boot, CEVT.boot$tail.pars$xi)
+        beta_boot <- c(beta_boot, CEVT.boot$tail.pars$beta)
+        GARCH.pars_boot <- rbind(GARCH.pars_boot, coef(CEVT.boot$GARCH.fit))
+        
+        b <- length(xi_boot)
+        }
+    })
+  
+  # probability
+  alpha <- 1 - conf.level
+  
+  # compute the confidence intervals using the empirical distribution for the parameters
+  # obtain through bootstrapping
+  xi_CI <- quantile(xi_boot, probs = c(alpha/2, 1-alpha/2))
+  beta_CI <- quantile(beta_boot, probs = c(alpha/2, 1-alpha/2))
+  GARCH.pars_CI <- apply(GARCH.pars_boot, 2, 
+                         function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  
+  # return the bootstrap confidence intervals
+  return(list(xi_CI = xi_CI, beta_CI = beta_CI, GARCH.pars_CI = GARCH.pars_CI))
+}
+
+
+CEVT_tails <- function(CEVT.fit, VaR.level = 0.95, predict = TRUE, 
+                       CIs = TRUE, conf.level = 0.95, boot = 500){
+  #================================================================================
+  # A function which carries out tail inference using the C-EVT model. 
+  # If predict = TRUE tail inference is performed 1-period ahead. 
+  # If predict = FALSE tail inference is performed for the periods corresponding to data y. 
+  # For each period in consideration the (VaR, xi, beta) triplet is estimated. Further,
+  # if CIs = TRUE, bootstrapping is used in order to compute confidence intervals for 
+  # the tail risk measures.
+  #
+  # INPUTS
+  # CEVT.fit: a list with named components y, CEVT.pars, GARCH.fit, u, sigma, tail.pars 
+  #           as returned by the CEVT_fit() function. 
+  # VaR.level: the level at which to compute VaR. (1 x 1)
+  # predict: logical indicating whether to perform forward or backward tail inference. 
+  # CIs: logical indicating whether to compute bootstrap CIs.
+  # conf.level: confidence level for the confidence intervals of the estimates. (1 x 1)
+  # boot: the number of bootstrap resamples to use. (1 x 1)
+  #
+  # OUTPUTS
+  # tail.risk: a named list with components:
+  #            risk.meas: a dataframe containing the tail risk triplets with named columns.
+  #                       (1 x 3) or (n x 3)
+  #            risk.meas_CI: a dataframe containing the tail risk triplets CIs with named 
+  #                          columns. (1 x 6) or (n x 6)
+  #================================================================================
+  # retrieve the residual tail parameters from the CEVT.fit object
+  xi.res <- CEVT.fit$tail.pars$xi
+  beta.res <- CEVT.fit$tail.pars$beta
+  phi <- CEVT.fit$tail.pars$phi
+  u.res <- CEVT.fit$u
+  
+  # if predict = TRUE compute 1-day ahead risk-measures
+  if(predict){
+    # "predict" the one-day ahead conditional volatility 
+    sigma <- sigma(ugarchforecast(CEVT.fit$GARCH.fit, n.ahead = 1))
+  }
+  # if predict = FALSE compute risk measures on past data
+  else{
+    # retrieve the fitted conditional volatilities
+    sigma <- sigma(CEVT.fit$GARCH.fit)
+  }
+  
+  # compute xi, beta and VaR at level VaR.level
+  xi <- xi.res * rep(1, length(sigma))
+  beta <- sigma * beta.res
+  alpha.VaR <- 1 - VaR.level
+  if(abs(xi.res)>1e-14) VaR <- sigma * u.res + beta/xi * ( (phi/alpha.VaR)^xi - 1 )
+  else VaR <- sigma * u.res + beta * log( phi/alpha.VaR )
+    
+  # tail risk measures
+  VaR.name <- paste0(VaR.level,"-VaR")
+  risk.meas <- data.frame(VaR, xi, beta)
+  colnames(risk.meas) <- c(VaR.name, "xi", "beta")
+  risk.meas_CI <- NA
+  
+  if(CIs){
+    # initialise matrices to contain bootstrap samples (each column
+    # corresponds to a new sample)
+    b <- 0
+    VaR_boot <- c()
+    xi_boot <- c()
+    beta_boot <- c()
+    
+    suppressWarnings({
+      while(b < boot){
+        # form a new bootstrap sample
+        y_ <- CEVT_bootstrap(CEVT.fit)
+    
+        # fit the C-EVT model to the new sample
+        flag <- FALSE
+        tryCatch(CEVT.boot <- CEVT_fit(y_, thresh = CEVT.fit$CEVT.pars$thresh,
+                              q.GARCH = CEVT.fit$CEVT.pars$q.GARCH,
+                              p.GARCH = CEVT.fit$CEVT.pars$p.GARCH), 
+                 error = function(e) flag <- TRUE)
+        if(flag) next
+      
+      
+        # compute tail risk measures on bootstrap sample
+        tail_boot <- CEVT_tails(CEVT.boot, VaR.level = VaR.level, predict = predict, 
+                                CIs = FALSE)$risk.meas
+
+        VaR_boot <- cbind(VaR_boot, tail_boot[,VaR.name])
+        xi_boot <- cbind(xi_boot, tail_boot$xi) 
+        beta_boot <- cbind(beta_boot, tail_boot$beta)
+      
+        b <- ncol(VaR_boot)
+      
+      }
+    })
+  
+    # probability
+    alpha.CI <- 1 - conf.level
+  
+    # compute the confidence intervals using the empirical distribution for the risk measures
+    # obtain through bootstrapping
+    quant_fun <- function(x) quantile(x, probs = c(alpha.CI/2, 1-alpha.CI/2))
+    VaR_CI <- apply(VaR_boot, 1, quant_fun)
+    xi_CI <- apply(xi_boot, 1, quant_fun)
+    beta_CI <- apply(beta_boot, 1, quant_fun)
+    
+    # tail risk measures confidence intervals
+    risk.meas_CI <- data.frame(t(rbind(VaR_CI, xi_CI, beta_CI)))
+    colnames(risk.meas_CI) <- paste0(c(paste0(VaR.name, c(".lower.", ".upper.")), 
+                                       "xi.lower.", "xi.upper.", 
+                                       "beta.lower.", "beta.upper."), conf.level)
+  }
+  return(list(risk.meas = risk.meas, risk.meas_CI = risk.meas_CI))
+}
+
+```
+
+```{r}
+# C-EVT data simulation study
+n <- 5000
+p.GARCH <- 1
+q.GARCH <- 1
+
+# simulate data from a GARCH model with heavy tails
+fit.spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(p.GARCH, q.GARCH)),
+                       mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+                       distribution.model = "std", 
+                       fixed.pars = list(omega = 0.02, alpha1 = 0.05, beta1 = 0.04, shape = 4))
+y <- fitted(ugarchpath(fit.spec, n.sim = n))
+
+CEVT.fit <- CEVT_fit(y)
+CEVT_tails(CEVT.fit)
+
+```
+
+## Realised Measures
+We compute the following realised measures:
+For a process $X$ sampled at discrete times $i\Delta_n$ for $i=0,1,\dots,T/\Delta_n$:
+\begin{itemize}
+\item the realised variance over $[0,T]$ is 
+\[RV(\Delta_n)_T = \sum_{i=1}^{T/\Delta_n} (\Delta^n_i X)^2\]
+\item for $p>0$, the $p$-th power variation over $[0,T]$ is 
+\[B(p, \Delta_n)_T = \sum_{i=1}^{T/\Delta_n} |\Delta^n_i X|^p\]
+\item for $k\geq 2$, the $[2,k]$-th multipower variation over $[0,T]$ is 
+\[M([k], \Delta_n)_T = \sum_{i=1}^{T/\Delta_n - k+1} |\Delta^n_{i}X|^{2/k}\ldots |\Delta^n_{i+k-1}X|^{2/k} \]
+\item for $p>0$ and and integer $k\geq 2$, the $[p,k]$-th multipower variation over $[0,T]$ is 
+\[M([p,k], \Delta_n)_T = \sum_{i=1}^{T/\Delta_n - k+1} |\Delta^n_{i}X|^{p/k}\ldots |\Delta^n_{i+k-1}X|^{p/k} \]
+\item for a truncation level $u_n$, the truncated realised variance over $[0,T]$ is
+\[RV(\Delta_n, u_n)_T = \sum_{i=1}^{T/\Delta_n}(\Delta^n_iX)^2 \chi_{\{|\Delta^n_iX
+| \leq u_n\}}\]
+\item for a truncation level $u_n$ and $p>0$, the truncated $p$-th power variation over $[0,T]$ is
+\[B(p, \Delta_n, u_n)_T = \sum_{i=1}^{T/\Delta_n}|\Delta^n_iX|^p \chi_{\{|\Delta^n_i X
+| \leq u_n\}}\]
+\end{itemize}
+
+We also implement code for realised semivariances and (signed) jump variations.
+For a process $X$ sampled at discrete times $i\Delta_n$ for $i=0,1,\dots,T/\Delta_n$:
+\begin{itemize}
+\item for a truncation level $u_n$ the estimator of the jump component of quadratic variation over $[0,T]$ given by the difference between realised variance and truncated realised variance is:
+\[\hat{J}(\Delta_n , u_n)_T =RV(\Delta_n)_T - RV(\Delta_n, u_n)_T\]
+\item the upside realised semivariance over $[0,T]$ is 
+\[RS^+_T(\Delta_n) = \sum_{i=1}^{T/\Delta_n}(\Delta_n^iX_t)^2 \chi_{\{\Delta_n^iX_t \geq 0\}}\]
+\item the downside realised semivariance over $[0,T]$ is 
+\[RS^-_T(\Delta_n) = \sum_{i=1}^{T/\Delta_n}(\Delta_n^iX_t)^2 \chi_{\{\Delta_n^iX_t < 0\}}\]
+\item the signed jump variations over $[0,T]$:
+\[\Delta J^{2+}_t  = \max\{0, RS^+_t - RS^-_t \}\]
+\[\Delta J^{2-}_t  = \max\{0, RS^-_t - RS^+_t \}.\]
+\end{itemize}
+
+
+```{r}
+# REALISED MEASURES
+
+RV <- function(y, daily = TRUE){
+  #================================================================================
+  # A function which computes the (daily) realised variance for high frequency 
+  # returns y.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  #
+  # OUTPUTS
+  # RV: the (daily) realised variances as an xts object.
+  #================================================================================
+  if(daily) RV <- apply.daily(y, function(x) sum(x^2))
+  else RV <- sum(y^2)
+  return(RV)
+}
+
+PV <- function(y, p, daily = TRUE){
+  #================================================================================
+  # A function which computes the (daily) p-th power variation for high frequency 
+  # observations y. Note p = 2 corresponds to RV.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # p: the power of the power variation. (1 x 1)
+  #
+  # OUTPUTS
+  # PV: the (daily) p-th power variations as an xts object.
+  #================================================================================
+  if(daily) PV <- apply.daily(y, function(x) sum(x^p))
+  else PV <- sum(y^p)
+  return(PV)
+}
+
+MPV <- function(y, p, k, daily = TRUE){
+  #================================================================================
+  # A function which computes the (daily) [p, k]-th multi-power variation for high frequency 
+  # observations y. Note p = 2 is also known as the [k]-th multi-power variation and 
+  # provides a (scaled) estimator for the integrated volatility.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # p: the power of the multipower variation. (1 x 1)
+  # k: the lag of the multipower variation. (1 x 1)
+  #
+  # OUTPUTS
+  # MPV: the (daily) [p,k]-th power variations as an xts object.
+  #================================================================================
+  if(daily) MPV <- apply.daily(y, function(x) MPV(x, p = p, k = k, daily = FALSE))
+  else{
+    MPV.period <- rep(1, l = (length(y) - k + 1))
+    for(i in 1:k){
+      MPV.period <- MPV.period * abs(as.numeric(y[i:(length(y) - k + i)]))^(p/k)
+    }
+    MPV <- sum(MPV.period)
+  }
+  
+  return(MPV)
+}
+
+TRV_u <- function(y, u){
+  #================================================================================
+  # A function which computes the (daily) truncated realised variance for high frequency 
+  # observations y and "time-invariant" threshold u.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # u: the cutoff threshold. (1 x 1)
+  #
+  # OUTPUTS
+  # TRV: the (daily) truncated realised variances as an xts object.
+  #================================================================================
+  if(daily) TRV <- apply.daily(y, function(x) sum(x[abs(x)<=u]^2))
+  else TRV <- sum(y[abs(y)<=u]^2)
+  return(TRV)
+}
+
+TPV_u <- function(y, u, p){
+  #================================================================================
+  # A function which computes the (daily) truncated p-th power variation for high frequency 
+  # observations y and "time-independent" threshold u. Note p = 2 corresponds to TRV_u.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # u: the cutoff threshold. (1 x 1)
+  # p: the power of the power variation. (1 x 1)
+  #
+  # OUTPUTS
+  # TPV: the (daily) truncated p-th power variations as an xts object.
+  #================================================================================
+  if(daily) TPV <- apply.daily(y, function(x) sum(x[abs(x)<=u]^p))
+  else TPV <- sum(y[abs(y)<=u]^p)
+  return(TPV)
+}
+
+J_u <- function(y, u){
+  #================================================================================
+  # A function which computes the (daily) jump component of quadratic variation by
+  # differencing of the realised variance and truncated realised variance for 
+  # high frequency observations y and "time-independent" threshold u. 
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # u: the cutoff threshold. (1 x 1)
+  #
+  # OUTPUTS
+  # J: the (daily) jump components of quadratic variation as an xts object.
+  #================================================================================
+  if(daily) J <- apply.daily(y, function(x) J_u(x, u = u))
+  else J <- RV(y) - TRV_u(y, u = u)
+  return(J)
+}
+
+RS <- function(y, daily = TRUE, upside = TRUE){
+  #================================================================================
+  # A function which computes the (daily) upside (or downside) realised semivariance
+  # for high frequency returns y.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # upside: boolean indicating whether the upside or downside semivariance is to be computed.
+  #
+  # OUTPUTS
+  # RS: the (daily) upside (or downside) realised semivariances as an xts object.
+  #================================================================================
+  if(daily){
+    if(upside) RS <- apply.daily(y, function(x) sum(x[x>=0]^2))
+    else RS <- apply.daily(y, function(x) sum(x[x<0]^2))
+  }
+  else{
+    if(upside) RS <- sum(y[y>=0]^2)
+    else RS <- sum(y[y<0]^2)
+  }
+  return(RS)
+}
+
+SJV <- function(y, daily = TRUE, upside = TRUE){
+  #================================================================================
+  # A function which computes the (daily) upside (or downside) signed jump variation (SJV)
+  # for high frequency returns y.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # upside: boolean indicating whether the upside or downside SJV is to be computed.
+  #
+  # OUTPUTS
+  # SJV: the (daily) upside (or downside) SJV as an xts object.
+  #================================================================================
+  JV <- RS(y, daily = daily, upside = TRUE) - RS(y, daily = daily, upside = FALSE)
+  sign <- (JV >= 0)
+  if(upside) SJV <- JV*sign
+  else SJV <- -JV*(1-sign)
+  return(SJV)
+}
+
+```
+
+Next we implement the procedure to select the threshold $u$ in practice:
+\begin{enumerate}
+\item find a preliminary estimator for $c_{\text{avg}}$, for example
+\[c_{\text{avg}} = \frac{1}{T} \tilde{M}([3],\Delta_n)_T\] 
+where $\tilde{M}([3], \Delta_n)_T$ is the multipower estimator of the integrated volatility.
+\item take $u_n$ the smallest value satisfying
+\[g\bigg(u_n\sqrt{\frac{\zeta}{c_{\text{avg}}\Delta_n}}\bigg) \leq \frac{\theta}{\zeta} \sqrt{\frac{2\Delta_n}{T}}\]
+where we want the bias of the estimate $RV(\Delta_n, u_n)_T$ to be within a fraction $\theta$ (for example 0.1) of standard deviations of estimation error of the true value $C_T$. Here $g(u) = \int_{\{|x|>u\}} x^2 \mathcal{N}(dx)$ and $\mathcal{N}$ is a standard normal distribution.
+\end{enumerate}
+\begin{remark}
+In applications with $T=1$, i.e. one trading day, empirical evidence shows that a sensible choice for $\zeta$ is 2 or 3.
+\end{remark}
+
+```{r}
+u_daily <- function(y, zeta = 3, theta = 0.1){
+  #================================================================================
+  # A function which finds the daily cutoff level u for high frequency 
+  # observations y using the procedure described above.
+  #
+  # INPUTS
+  # y: the high frequency returns corresponding to a single trading day as an xts object.
+  # zeta: is an empirical quantity s.t. c_max/c_min <= zeta. (1 x 1)
+  # theta: is a parameter controlling the bias of the RV estimate. (1 x 1)
+  #
+  # OUTPUTS
+  # u.daily: the daily cutoff level. (1 x 1)
+  #================================================================================
+  # compute how long the day was (in trading days) - some days markets close before -
+  # and the frequency of the observations in minutes per trading day
+  # Here a trading day is 9:30 - 16:00 hence 60*6.5 = 390 minutes
+  T. <- nminutes(y) / 390
+  Delta <- periodicity(y)$frequency / 390
+  
+  # find the preliminary estimator for the average squared volatility over [0,T.]
+  m <- integrate(function(x) abs(x)^(2/3)*dnorm(x), -Inf, Inf)$value
+  c_avg <- m^(-3)*MPV(y, p = 2, k = 3) / T.
+  
+  # function g as described above
+  g <- function(u){
+      2*integrate(function(z) z^2*dnorm(z), u, Inf)$value
+  }
+  
+  # objective function to be minimised to find u
+  find_u <- function(u){
+    if(g( u * sqrt(zeta/(c_avg*Delta)) ) <= theta/zeta * sqrt(2*Delta/T.) ) return(u)
+    else return(max(abs(y)))
+  }
+  
+  u.daily <- optimize(find_u, interval = c(0, max(abs(y))))$minimum
+  
+  return(u.daily)
+}
+
+SPY.day <- SPY.HF["2018-01-04"]
+u <- u_daily(SPY.day)
+SPY.day <- cbind(SPY.day, abs(SPY.day) > u)
+names(SPY.day) <- c("returns", "jumps")
+
+
+p_ret <- ggplot(SPY.day, aes(x = Index)) + geom_point(aes(y = returns, col = factor(jumps))) + 
+  geom_hline(yintercept = u, lty = "dashed") + geom_hline(yintercept = -u, lty = "dashed") +
+  ylab("HF returns") + xlab("") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none") +
+  scale_color_manual(values = c("black", "red"))
+p_ret
+
+SPY.price <- rbind(xts(c(100), order.by = as.POSIXct(c("2018-01-04 09:30:00"), tz = "UTC")),
+                   100*exp(cumsum(SPY.day$returns)))
+df.jumps <- data.frame(cbind(tail(index(SPY.price), -1), head(index(SPY.price), -1),
+                             embed(SPY.price, 2)))
+colnames(df.jumps) <- c("time.end", "time", "price.end", "price")
+df.jumps$jump <- ifelse(abs(log(df.jumps$price.end) - log(df.jumps$price)) > u, 
+                        "Jumps", "No jump")
+
+p_price <- ggplot(df.jumps) + 
+  geom_segment(aes(x = time, y = price, xend = time.end, yend = price.end, colour = jump)) +
+  scale_x_discrete(labels = index(SPY.day)) +
+  ggtitle("Identifying jumps on 2018-01-04") + ylab("price (rescaled)") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none",
+        axis.title.x = element_blank(), axis.ticks.x = element_blank(), 
+        axis.text.x = element_blank()) + 
+  scale_color_manual(values = c("red", "black"))
+  
+p_price
+
+p <- plot_grid(p_price, p_ret, nrow = 2)
+
+p
+
+save_plot("Thesis plots/identifyingjumps.jpg", p, nrow = 2, dpi = 600, limitsize = FALSE)
+```
+
+We can hence rewrite the functions for truncated realised variance and truncated power variation with "adjusting" threshold $u$ selected with this procedure, as well as the ones for estimating the jump component of quadratic variation and the realised jump tail shape.
+
+```{r}
+
+TRV_daily <- function(y, zeta = 3, theta = 0.1){
+  #================================================================================
+  # A function which computes the (daily) truncated realised variance for high frequency 
+  # observations y and adjusting threshold u selected via the procedure described above.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # theta, zeta: parameters for the choice of the daily threshold to be passed on to u_daily.
+  #
+  # OUTPUTS
+  # TRV: the daily truncated realised variances as an xts object.
+  #================================================================================
+  TRV <- apply.daily(y, function(x) 
+    sum( 
+      x[abs(x) <= u_daily(x, zeta = zeta, theta = theta)]^2 
+      )
+    )
+  return(TRV)
+}
+
+TPV_daily <- function(y, p, zeta = 3, theta = 0.1){
+  #================================================================================
+  # A function which computes the daily trunctated p-th power variation for high frequency 
+  # observations y and adjusting threshold u selected via the procedure described above.
+  # Note p = 2 corresponds to TRV.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # p: the degree of power variation. (1 x 1)
+  # theta, zeta: parameters for the choice of the daily threshold to be passed on to u_daily.
+  #
+  # OUTPUTS
+  # TPV: the daily truncated p-th power variations as an xts object.
+  #================================================================================
+  TPV <- apply.daily(y, function(x) 
+    sum(
+      x[abs(x) <= u_daily(x, zeta = zeta, theta = theta)]^p
+      )
+    )
+  return(TPV)
+}
+
+J_daily <- function(y, zeta = 3, theta = 0.1, alpha = 0.005){
+  #================================================================================
+  # A function which computes the (daily) jump component of quadratic variation by
+  # differencing of the realised variance and truncated realised variance for 
+  # high frequency observations y and adjusting threshold u selected via the procedure
+  # described above. 
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # u: the cutoff threshold. (1 x 1)
+  # theta, zeta: parameters for the choice of the daily threshold to be passed on to u_daily.
+  # alpha: asymptotic size of the jump test to determine whether jumps have occured. (1 x 1)
+  #
+  # OUTPUTS
+  # J: the (daily) jump components of quadratic variation as an xts object.
+  #================================================================================
+  I <- apply.daily(y, function(x) J_test(x)$p_value < alpha)
+  J <- I*(RV(y) - TRV_daily(y, zeta = zeta, theta = theta))
+  return(J)
+}
+
+J_shape <- function(y, lower = TRUE, thresh = 0.25, zeta = 3, theta = 0.1){
+  #================================================================================
+  # A function which computes the lower (or upper) realised jump tail shape from the
+  # whole sample y. The jump and continuous components are disentangled on a daily basis
+  # by selecting the threshold u with the procedure described above. The realised tail shape
+  # is then computed by applying the IID POT model above the thresh-quantile of what are
+  # considered jumps. We note that the jumps detected are already of the "big" type, hence 
+  # we set the default of thresh to 0.25.
+  #
+  # INPUTS
+  # y: the high frequency returns as an xts object.
+  # lower: boolean indicating whether the upper or lower tail shape should be estimated. (1 x 1)
+  # thresh: the quantile of the jump set above which we apply the IID POT model. (1 x 1)
+  # theta, zeta: parameters for the choice of the daily threshold to be passed on to u_daily.
+  #
+  # OUTPUTS
+  # xi_J: the lower (or upper) realised jump tail shape. (1 x 1)
+  #================================================================================
+  dates <- index(to.daily(y))
+  
+  # detect jumps in y
+  jumps <- c()
+  for(i in 1:length(dates)){
+    date <- dates[i]
+    daily_ret <- y[as.character(date)]
+    u <- u_daily(daily_ret, zeta = zeta, theta = theta)
+    if(lower) jumps <- c(jumps, coredata(-daily_ret[daily_ret <= -u]))
+    else jumps <- c(jumps, coredata(daily_ret[daily_ret >= u]))
+  }
+  
+  # apply IID POT to exceedances
+  u <- quantile(jumps, thresh)
+  xi_J <- IID_POT_fit(jumps, u)$pars$xi
+  
+  return(xi_J)
+}
+```
+
+Next we implement a function to test the data for jumps. We consider the statistic for $k\geq 2$
+\[S^{(J)}(k, \Delta_n) = RV(\Delta_n)_T - \tilde{M}([k], \Delta_n)_T\]
+where $\tilde{M}([k], \Delta_n)_T = (m_{2/k})^{-k} M([k], \Delta_n)_T$. Under appropriate rescaling, this statistic converges stably in law to a normal distribution in restriction to the set
+\[\Omega_T^{(c)} = \{\omega : t\rightarrow X_T(\omega) \text{ is continuous on } [0,T]\}.\]
+We can hence test the null $H_0: \omega \in \Omega_T^{(c)}$ by using the critical rejection region
+\[\mathcal{C}_n = \bigg\{ S^{(J)} (k, \Delta_n) > z_{1-\alpha} \sqrt{\frac{\vartheta''(k) M([4,k' ], \Delta_n)_T}{(m_{4/k' })^{k'}}} \bigg\}\]
+where $k'\geq2$, $z_{1-\alpha}$ is the $(1-\alpha)$-quantile of a normal distribution and 
+\begin{align*}
+	&\vartheta(k) = \frac{1}{(m_{2/k})^{2k}(m_{4/k} - (m_{2/k})^2)} \{(m_{4/k})^{k+1} + (m_{4/k})^k (m_{2/k})^2 +
+	\\ 
+	&\qquad \qquad \qquad -(2k+1)m_{4/k}(m_{2/k})^{2k} + (2k-1) (m_{2/k})^{2k+2}\},\\
+	&\vartheta'(k) = \frac{k(m_{2+2/k}-m_{2/k})}{m_{2/k}},\\
+	&\vartheta''(k) = \vartheta(k) + 2(1-\vartheta'(k)).
+\end{align*}
+We note that this sequence of test, under appropriate assumptions on $X$, has strong asymptotic size $\alpha$ for the null $\Omega^{(cW)}_T$ and is consistent for the alternative $\Omega^{(j)}_T$.
+
+```{r}
+# JUMP TEST
+
+J_test <- function(y, k = 2, k1 = 3, alpha = 0.005){
+  #================================================================================
+  # A function which tests the null-hypothesis that the underlying path corresponding
+  # to the high-frequency increments in y is continuous.
+  #
+  # INPUTS
+  # y: the high frequency data as an xts object.
+  # k: the lag of the multipower estimator to use to estimate the integrated volatility. (1 x 1)
+  # k1: the lag of the multipower estimator to use to estimate the quarticity. (1 x 1)
+  # alpha: the strong asymptotic size of the test. (1 x 1)
+  #
+  # OUTPUTS
+  # A list with named components:
+  #     p_value: the p_value of the test.
+  #     result: the test result, a string.
+  #================================================================================
+  m_2.k <- integrate(function(x) abs(x)^(2/k)*dnorm(x), -Inf, Inf)$value
+  m_4.k <- integrate(function(x) abs(x)^(4/k)*dnorm(x), -Inf, Inf)$value
+  m_22.k <- integrate(function(x) abs(x)^(2+2/k)*dnorm(x), -Inf, Inf)$value
+  m_4.k1 <- integrate(function(x) abs(x)^(4/k1)*dnorm(x), -Inf, Inf)$value
+  
+  v <- ((m_4.k)^(k+1) + (m_4.k)^k*(m_2.k)^2 - (2*k+1)*m_4.k*m_2.k^(2*k) +
+          (2*k-1)*(m_2.k)^(2*k+2)) / ((m_2.k)^(2*k)*(m_4.k - (m_2.k)^2))
+  v1 <- k*(m_22.k - m_2.k)/m_2.k
+  v2 <- v + 2*(1 - v1)
+    
+  # Compute the jump test statistic
+  S_J <- RV(y, daily = FALSE) - (m_2.k)^(-k) * MPV(y, p = 2, k, daily = FALSE)
+  
+  # rescale the jump test test statistic and compute p-value
+  S_J.scaled <- sqrt((m_4.k1)^k1 / (v2 * MPV(y, p = 4, k1, daily = FALSE)))*S_J
+  p_value <- pnorm(S_J.scaled, lower.tail = FALSE)
+  
+  # Carry out the test
+  I <- ( p_value < alpha )
+  
+  if(I) result <- "Reject the null H_0: no jumps"
+  else result <- "Do not reject the null H_0: no jumps"
+  
+  return(list(p_value = p_value, result = result))
+}
+
+# Carry out the test on a daily basis
+ep <- endpoints(SPY.HF, on = "days")
+ps <- period.apply(SPY.HF, INDEX = ep, FUN = function(x) J_test(x)$p_value)
+tformat(ps) <- "%Y-%m"
+
+# plot the results of the test
+p <- ggplot(ps, aes(x = Index)) + geom_point(aes(y = ps)) + ylab("p-values") +
+  xlab("") + geom_hline(yintercept = 0.005, col = "red") + scale_y_continuous(trans = "log10") +
+  ggtitle("Jump test p-values with 99.5% confidence level") +
+  theme(plot.title = element_text(hjust = 0.5))
+p
+
+save_plot("Thesis plots/jumptest.jpg", p, dpi = 600, limitsize = FALSE)
+```
+
+## HAR-EVT model
+
+The return process $\{Y_t,\ t\in \mathbb{Z}\}$ is assumed to be:
+\begin{align*}
+		Y_t &= \sigma_t Z_t\\
+		\sigma_{t}^2 &= \exp\{ \boldsymbol{\beta}^T \boldsymbol{RM}_{t-1}\}
+\end{align*}
+where $(Z_t)_t\sim SWN(0, 1)$, $\boldsymbol{\beta} = (\beta^{(0)}, \beta^{(d)}, \beta^{(w)}, \beta^{(m)})^T$ and \\$\boldsymbol{RM}_{t-1} = (1, \log RV_{t-1}, \log RV^{(w)}_{t-1},\log RV^{(m)}_{t-1})^T$. And:
+\[\log RV^{(n)}_{t} = n^{-1}[\log RV_{t-n+1} + \ldots + \log RV_{t}]\]
+for $w = 5, m = 22$.
+We assume the tail of the negated residuals, i.e. $-Z$, above a fixed threshold $u$ follows a GPD with parameters $\xi$, $\beta$ and has threshold exceedance probability $\mathbb{P}(-Z\geq u) = \phi$.
+
+```{r}
+# HAR-EVT model
+to_RM_HAR <- function(x){
+  #================================================================================
+  # A function which transforms the vector of high frequency returns x into the matrix
+  # RM of covariates 1, log RV, log RV^(w), log RV^(m) for the HAR model. 
+  # The first row of RM corresponds to the information available on day 22 of x.
+  # 
+  # INPUTS
+  # x: the intra-day high frequency log-returns, an xts object.
+  #
+  # OUTPUTS
+  # RM: matrix of realised measures corresponding to days 22,23,...of x.
+  #================================================================================
+  # apply log-transform
+  RV <- log(RV(x))
+  
+  # compute weekly and monthly log RVs
+  RV.W <- rollmean(RV, 5)
+  RV.M <- rollmean(RV, 22)
+  
+  # crop the "heads" of daily and weekly RMs to make the same length
+  # as the monthly one
+  RV <- tail(RV, -21)
+  RV.W <- tail(RV.W, -17)
+  time.index <- index(RV)
+  
+  # form the matrix of realised measures
+  m <- length(RV.M)
+  RM <- matrix(c(rep(1, m), RV, RV.W, RV.M), nrow = m)
+  RM <- xts(RM, time.index)
+  names(RM) <- c("Intercept", "RV", "RV.W", "RV.M")
+  return(RM)
+}
+
+to_RM_HARJ <- function(x){
+  #================================================================================
+  # A function which transforms the vector of high frequency returns x into the matrix
+  # RM of covariates 1, log RV, log RV^(w), log RV^(m), log(1+ J_t) for the HAR-J model. 
+  # The first row of RM corresponds to the information available on day 22 of x.
+  # 
+  # INPUTS
+  # x: the intra-day high frequency log-returns, an xts object.
+  #
+  # OUTPUTS
+  # RM: matrix of realised measures corresponding to days 22,23,...of x.
+  #================================================================================
+  # apply log-transform
+  RV <- log(RV(x))
+  
+  # compute weekly and monthly log RVs
+  RV.W <- rollmean(RV, 5)
+  RV.M <- rollmean(RV, 22)
+  J <- log(1 + J_daily(x))
+  
+  # crop the "heads" of daily and weekly RMs to make the same length
+  # as the monthly one. Scale J in order to have it on the same scale as RV.
+  RV <- tail(RV, -21)
+  J <- tail(J, -21)*1e6
+  RV.W <- tail(RV.W, -17)
+  time.index <- index(RV)
+  
+  # form the matrix of realised measures
+  m <- length(RV.M)
+  RM <- matrix(c(rep(1, m), RV, RV.W, RV.M, J), nrow = m)
+  RM <- xts(RM, time.index)
+  names(RM) <- c("Intercept", "RV", "RV.W", "RV.M", "J")
+  return(RM)
+}
+
+quasiloglikelihood_HAR.EVT <- function(y, RM.fit, beta){
+  #================================================================================
+  # A function which computes the quasi log-likelihood of a return sample with the HAR 
+  # specification of volatility and misspecified normal innovations.
+  #
+  # INPUTS
+  # y: the returns sample. (n x 1)
+  # RM.fit: the covariates matrix where each row corresponds to the covariates on which
+  #     y[t] is regressed, (n x p)
+  # beta: the parameter vector. (p x 1)
+  #
+  # OUTPUTS
+  # QLL: the quasi log likelihood. (1 x 1)
+  #================================================================================
+  
+  sigma2 <- as.vector(exp(RM.fit%*%beta))
+  QLL <- sum(-0.5*log(2*pi*sigma2) - y^2/(2*sigma2))
+  
+  return(QLL)
+}
+
+gr_quasiloglikelihood_HAR.EVT <- function(y, RM.fit, beta){
+  #================================================================================
+  # A function which computes the gradient of the quasi log-likelihood for a return 
+  # sample with the HAR specification of volatility and misspecified normal innovations.
+  #
+  # INPUTS
+  # y: the returns sample. (n x 1)
+  # RM.fit: the covariates matrix where each row corresponds to the covariates on which
+  #     y[t] is regressed. (n x p)
+  # beta: the parameter vector. (p x 1)
+  #
+  # OUTPUTS
+  # gr_QLL: the gradient of the quasi log likelihood. (1 x 1)
+  #================================================================================
+  
+  sigma2 <- as.vector(exp(RM.fit %*% beta))
+  gr_QLL <- apply((y^2/(2*sigma2) - 0.5)*RM.fit, 2, sum)
+  
+  return(gr_QLL)
+}
+
+HAR.EVT_fit <- function(y, x, thresh = 0.9, RM = NULL){
+  #================================================================================
+  # A function which fits the HAR-EVT model to the return data y, i.e. the data is 
+  # fitted with a HAR-like model for the volatility, then an IID POT model is fitted to the 
+  # lower tail of the standardised residuals. Note that y and x should be xts objects with
+  # appropriate date indexing.
+  # By default the HAR-J specification is used for the variance. Directly provide RM to override
+  # this setting.
+  #
+  # INPUTS
+  # y: the return data an xts object. (n x 1)
+  # x: the intra-day high frequency log-returns starting one month (22 days) before the 
+  #    first return, an xts object.
+  # thresh: the quantile above which to fit the POT model to the residuals. (1 x 1)
+  # RM: the HAR-like realised measures starting on the day before the returns, if 
+  #     RM is provided then x is ignored. ((n+1) x p)
+  #
+  # OUTPUTS
+  # fit: a list with named components:
+  #     y: the return data. (n x 1)
+  #     RM: the matrix of realised measures corresponding to days 0,1,...,n. ((n+1) x p)
+  #     thresh: the quantile above which to fit the POT model to the residuals. (1 x 1)
+  #     beta.HAR: the estimates for the HAR sepcification parameters (p x 1)
+  #     sigma: the vector of fitted conditional volatilities. (n x 1)
+  #     u: the threshold used for the POT on the residuals. (n x 1)
+  #     tail.pars: a dataframe with named columns phi, xi, beta, the estimated
+  #                (lower) tail parameters of the innovation distribution. (1 x 3)
+  #================================================================================
+  n <- length(y)
+  
+  # transform the high frequency returns into the realised measures matrix
+  if(is.null(RM)) RM <- to_RM_HARJ(x)
+  
+  # fit the HAR-like specification with initial value given by OLS.
+  RM.fit <- head(RM, -1)
+  RV.fit <- tail(RM$RV, -1)
+  
+  # use OLS for starting values of beta
+  data_HAR <- xts(cbind(coredata(RV.fit), coredata(RM.fit)), order.by = index(RV.fit))
+  colnames(data_HAR) <- c("y", names(RM))
+  betaSV <- lm(y ~ 0+. , data = data_HAR)$coefficients
+
+  beta.HAR <- optim(as.numeric(betaSV), 
+                    function(beta) - quasiloglikelihood_HAR.EVT(y, RM.fit, beta),
+                    gr = function(beta) -gr_quasiloglikelihood_HAR.EVT(y, RM.fit, beta))$par
+
+  # compute the fitted volatilities
+  sigma <- sqrt(exp(RM.fit%*%beta.HAR))
+  
+  # compute the negated residuals and fit the IID POT model to these
+  z <- y/sigma
+  x <- -z
+  u <- quantile(x, thresh)
+  fit.POT <- IID_POT_fit(x, u)
+  # extract the tail parameters
+  tail.pars <- fit.POT$pars
+  
+  beta.HAR <- data.frame(t(beta.HAR))
+  names(beta.HAR) <- names(RM)
+  return(list(y = y,
+              RM = RM,
+              thresh = thresh,
+              beta.HAR = beta.HAR, 
+              u = u, 
+              sigma = sigma, 
+              tail.pars = tail.pars))
+}
+
+HAR.EVT_bootstrap <- function(HAR.EVT.fit){
+  #================================================================================
+  # A function which creates a bootstrap resample for the HAR-EVT model using block 
+  # resampling of the residuals.
+  #
+  # INPUTS
+  # HAR.EVT.fit: a list with named components y, RM, thresh, beta.HAR, u, sigma, 
+  #              tail.pars as returned by the HAR.EVT_fit() function.
+  #
+  # OUTPUTS
+  # y_ : a resample of the data. (n x 1)
+  #================================================================================
+  # retrieve standardized residuals from HAR.EVT.fit
+  sigma <- HAR.EVT.fit$sigma
+  res <- HAR.EVT.fit$y/HAR.EVT.fit$sigma
+    
+  n <- length(res)
+  
+  # divide residuals into blocks of length l
+  l <- floor(n^0.5)
+  blocks <- matrix(rep(0, n*l), nrow = n)
+  res.wrap <- c(res, res[1:(l-1)])
+  for(i in 1:n){
+    blocks[i,] <- res.wrap[i:(i+l-1)]
+  }
+  
+  # resample residuals
+  resample <- sample(1:n, ceiling(n/l), replace = TRUE)
+  res_ <- c()
+  for(j in 1:ceiling(n/l)){
+    res_ <- c(res_, blocks[resample[j],])
+  }
+  res_ <- res_[1:n]
+  
+  # post-blacken residuals
+  y_ <- sigma * res_
+  
+  return(y_)
+}
+
+HAR.EVT_bootstrapCIs <- function(HAR.EVT.fit, conf.level = 0.95, boot = 500){
+  #================================================================================
+  # A function which computes the bootstrap confidence intervals for the parameters 
+  # of the HAR.EVT model.
+  # 
+  # INPUTS
+  # HAR.EVT.fit: a list with named components y, RM, thresh, beta.HAR, u, sigma, 
+  #              tail.pars as returned by the HAR.EVT_fit() function.
+  #
+  # OUTPUTS
+  # pars_CIs: a list with named components:
+  #           xi, beta, beta.HAR: dataframes containing the CIs.
+  #================================================================================
+  # initialise matrices to contain bootstrap samples (each row corresponds to a new sample)
+  xi_boot <- c()
+  beta_boot <- c()
+  beta.HAR_boot <- c()
+  
+  b <- 0
+  suppressWarnings({
+      while(b < boot){
+        # form a new bootstrap sample
+        y_ <- HAR.EVT_bootstrap(HAR.EVT.fit)
+    
+        # fit the HAR-EVT model to the new sample
+        flag <- FALSE
+        tryCatch(HAR.EVT.boot <- HAR.EVT_fit(y = y_, x = NULL, RM = HAR.EVT.fit$RM, 
+                                             thresh = HAR.EVT.fit$thresh), 
+                 error = function(e) flag <- TRUE)
+        if(flag) next
+    
+        # retain the fitted parameters
+        xi_boot <- c(xi_boot, HAR.EVT.boot$tail.pars$xi)
+        beta_boot <- c(beta_boot, HAR.EVT.boot$tail.pars$beta)
+        beta.HAR_boot <- rbind(beta.HAR_boot, HAR.EVT.boot$beta.HAR)
+        
+        b <- length(xi_boot)
+        }
+    })
+  
+  # probability
+  alpha <- 1 - conf.level
+  
+  # compute the confidence intervals using the empirical distribution for the parameters
+  # obtain through bootstrapping
+  xi_CI <- quantile(xi_boot, probs = c(alpha/2, 1-alpha/2))
+  beta_CI <- quantile(beta_boot, probs = c(alpha/2, 1-alpha/2))
+  beta.HAR_CI <- apply(beta.HAR_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  
+  # return the bootstrap confidence intervals
+  return(list(xi_CI = xi_CI, beta_CI = beta_CI, beta.HAR_CI = beta.HAR_CI))
+}
+
+HAR.EVT_tails <- function(HAR.EVT.fit, VaR.level = 0.95, predict = TRUE, 
+                       CIs = TRUE, conf.level = 0.95, boot = 500){
+  #================================================================================
+  # A function which carries out tail inference using the HAR-EVT model. 
+  # If predict = TRUE tail inference is performed 1-period ahead. 
+  # If predict = FALSE tail inference is performed for the periods corresponding to data y. 
+  # For each period in consideration the (VaR, xi, beta) triplet is estimated. Further,
+  # if CIs = TRUE, bootstrapping is used in order to compute confidence intervals for 
+  # the tail risk measures.
+  #
+  # INPUTS
+  # HAR.EVT.fit: a list with named components y, RM, thresh, beta.HAR, u, sigma, 
+  #              tail.pars as returned by the HAR.EVT_fit() function.
+  # VaR.level: the level at which to compute VaR. (1 x 1)
+  # predict: logical indicating whether to perform forward or backward tail inference. 
+  # CIs: logical indicating whether to compute bootstrap CIs.
+  # conf.level: confidence level for the confidence intervals of the estimates. (1 x 1)
+  # boot: the number of bootstrap resamples to use. (1 x 1)
+  #
+  # OUTPUTS
+  # tail.risk: a named list with components:
+  #            risk.meas: a dataframe containing the tail risk triplets with named columns.
+  #                       (1 x 3) or (n x 3)
+  #            risk.meas_CI: a dataframe containing the tail risk triplets CIs with named 
+  #                          columns. (1 x 6) or (n x 6)
+  #================================================================================
+  # retrieve the residual tail parameters from the HAR.EVT.fit object
+  xi.res <- HAR.EVT.fit$tail.pars$xi
+  beta.res <- HAR.EVT.fit$tail.pars$beta
+  phi <- HAR.EVT.fit$tail.pars$phi
+  u.res <- HAR.EVT.fit$u
+  
+  # if predict = TRUE compute 1-day ahead risk-measures
+  if(predict){
+    # "predict" the one-day ahead conditional volatility 
+    sigma <- sqrt(exp(tail(HAR.EVT.fit$RM, 1) %*% t(HAR.EVT.fit$beta.HAR)))
+  }
+  # if predict = FALSE compute risk measures on past data
+  else{
+    # retrieve the fitted conditional volatilities
+    sigma <- HAR.EVT.fit$sigma
+  }
+  
+  # compute xi, beta and VaR at level VaR.level
+  xi <- xi.res * rep(1, length(sigma))
+  beta <- sigma * beta.res
+  alpha.VaR <- 1 - VaR.level
+  if(abs(xi.res)>1e-14) VaR <- sigma * u.res + beta/xi * ( (phi/alpha.VaR)^xi - 1 )
+  else VaR <- sigma * u.res + beta * log( phi/alpha.VaR )
+    
+  # tail risk measures
+  VaR.name <- paste0(VaR.level,"-VaR")
+  risk.meas <- data.frame(VaR, xi, beta)
+  colnames(risk.meas) <- c(VaR.name, "xi", "beta")
+  risk.meas_CI <- NA
+  
+  if(CIs){
+    # initialise matrices to contain bootstrap samples (each column
+    # corresponds to a new sample)
+    b <- 0
+    VaR_boot <- c()
+    xi_boot <- c()
+    beta_boot <- c()
+    
+    suppressWarnings({
+      while(b < boot){
+        # form a new bootstrap sample
+        y_ <- HAR.EVT_bootstrap(HAR.EVT.fit)
+    
+        # fit the HAR-EVT model to the new sample
+        flag <- FALSE
+        tryCatch(HAR.EVT.boot <- HAR.EVT_fit(y = y_, x = NULL, RM = HAR.EVT.fit$RM, 
+                                             thresh = HAR.EVT.fit$thresh), 
+                 error = function(e) flag <- TRUE)
+        if(flag) next
+      
+        # compute tail risk measures on bootstrap sample
+        tail_boot <- HAR.EVT_tails(HAR.EVT.boot, VaR.level = VaR.level, predict = predict, 
+                                   CIs = FALSE)$risk.meas
+
+        VaR_boot <- cbind(VaR_boot, tail_boot[,VaR.name])
+        xi_boot <- cbind(xi_boot, tail_boot$xi) 
+        beta_boot <- cbind(beta_boot, tail_boot$beta)
+      
+        b <- ncol(VaR_boot)
+      
+      }
+    })
+  
+    # probability
+    alpha.CI <- 1 - conf.level
+  
+    # compute the confidence intervals using the empirical distribution for the risk measures
+    # obtain through bootstrapping
+    quant_fun <- function(x) quantile(x, probs = c(alpha.CI/2, 1-alpha.CI/2))
+    VaR_CI <- apply(VaR_boot, 1, quant_fun)
+    xi_CI <- apply(xi_boot, 1, quant_fun)
+    beta_CI <- apply(beta_boot, 1, quant_fun)
+    
+    # tail risk measures confidence intervals
+    risk.meas_CI <- data.frame(t(rbind(VaR_CI, xi_CI, beta_CI)))
+    colnames(risk.meas_CI) <- paste0(c(paste0(VaR.name, c(".lower.", ".upper.")), 
+                                       "xi.lower.", "xi.upper.", 
+                                       "beta.lower.", "beta.upper."), conf.level)
+  }
+  return(list(risk.meas = risk.meas, risk.meas_CI = risk.meas_CI))
+}
+
+```
+
+## R-POT model
+The conditional tail of the loss process $\{L_t,\ t\in \mathbb{Z}\}$ above a fixed high threshold $u$ is modelled by:
+\begin{align*}
+	\mathbb{P}(L_t > x|\mathcal{F}_{t-1}) = \phi_{t|t-1} G_{\xi_{t|t-1}, \beta_{t|t-1}}(x-u) 
+\end{align*}
+where
+\begin{align*}
+	\phi_{t|t-1} &= \text{logit}^{-1}\{\boldsymbol{\psi}^T \boldsymbol{RM}_{t-1}\}\\
+	\xi_{t|t-1} &= \exp\{\boldsymbol{\nu}^T \boldsymbol{RM}'_{t-1}\} \\
+	\beta_{t|t-1} &= \exp\{\boldsymbol{\kappa}^T \boldsymbol{RM}_{t-1}\}	
+\end{align*}
+and
+\begin{align*}
+	\boldsymbol{\psi} &= \Big(\psi^{(0)}, \psi^{(d)}, \psi^{(w)}, \psi^{(m)}, \psi^{(J)}, \psi^{(J+)}, \psi^{(J-)}\Big)^T\\
+	\boldsymbol{\nu} &= \Big(\nu^{(0)}, \nu^{(J)})^T \\
+	\boldsymbol{\kappa} &= \Big(\kappa^{(0)}, \kappa^{(d)}, \kappa^{(w)}, \kappa^{(m)}, \kappa^{(J)}, \kappa^{(J+)}, \kappa^{(J-)}\Big)^T\\	
+	\begin{split}
+	\boldsymbol{RM}_{t-1} &= \Big(1, \log RV^{(d)}_{t-1}, \log RV^{(w)}_{t-1}, \log RV^{(m)}_{t-1}, \\
+	&\qquad\qquad \log(1+\hat{J}_{t-1}), \log (1 + \Delta J^{2+}_{t-1}), \log (1 + \Delta J^{2-}_{t-1})\Big)^T
+	\end{split}\\
+	\boldsymbol{RM}'_{t-1} &= \Big(1,  \log (1 + \Delta (\xi^l_J)_{t-1})\Big)^T
+\end{align*}
+
+The MLEs for the parameters are given by:
+\begin{align*}
+	\boldsymbol{\hat\psi} &=  \underset{\boldsymbol{\psi}\in \Psi}{\text{argmax}} \frac{1}{n} \sum_{t=1}^n\bigg\{ i_t\log\big(\textrm{logit}^{-1}(\boldsymbol{\psi^T\boldsymbol{RM}_{t-1}})\big) + (1-i_t)\log\big(1-\textrm{logit}^{-1}(\boldsymbol{\psi}^T\boldsymbol{RM}_{t-1})\big)\bigg\}\\
+	(\boldsymbol{\hat\nu},\boldsymbol{\hat\kappa}) &= \underset{(\boldsymbol{\nu},\boldsymbol{\kappa})\in N\times K}{\text{argmax}} \frac{1}{n} \sum_{t=1}^n \bigg\{i_t \log\Big(g_{\exp\{\boldsymbol{\nu}^T\boldsymbol{RM}'_{t-1}\}), \exp\{\boldsymbol{\kappa}^T\boldsymbol{RM}_{t-1}\}}(x_t)\Big)\bigg\}
+\end{align*}
+
+We note that the first estimator is the MLE of a Binomial GLM with logit link function.
+
+```{r}
+# THE R-POT MODEL
+
+to_RM_HARSJ <- function(x){
+  #================================================================================
+  # A function which transforms the vector of high frequency returns x into the matrix
+  # RM of covariates 1, log RV, log RV^(w), log RV^(m), log(1+ J_t), log(1+ SJV+_t), 
+  # lg(1+ SJV-_t) for the HAR-SJ model. 
+  # The first row of RM corresponds to the information available on day 22 of x.
+  # 
+  # INPUTS
+  # x: the intra-day high frequency log-returns, an xts object.
+  #
+  # OUTPUTS
+  # RM: matrix of realised measures corresponding to days 22,23,...of x.
+  #================================================================================
+  # apply log-transform
+  RV <- log(RV(x))
+  SJV_up <- log(1 + SJV(x, upside = TRUE))
+  SJV_down <- log(1 + SJV(x, upside = FALSE))
+  
+  # compute weekly and monthly log RVs
+  RV.W <- rollmean(RV, 5)
+  RV.M <- rollmean(RV, 22)
+  J <- log(1 + J_daily(x))
+  
+  # crop the "heads" of daily and weekly RMs to make the same length
+  # as the monthly one, also scale the covariates of the form log(1 + J_t)
+  # to obtain all realised measures on the same scale.
+  RV <- tail(RV, -21)
+  J <- tail(J, -21)*1e06
+  SJV_up <- tail(SJV_up, -21)*1e06
+  SJV_down <- tail(SJV_down, -21)*1e06
+  RV.W <- tail(RV.W, -17)
+  time.index <- index(RV)
+  
+  # form the matrix of realised measures
+  m <- length(RV.M)
+  RM <- matrix(c(rep(1, m), RV, RV.W, RV.M, J, SJV_up, SJV_down), nrow = m)
+  RM <- xts(RM, time.index)
+  names(RM) <- c("Intercept", "RV", "RV.W", "RV.M", "J", "SJV_up", "SJV_down")
+  return(RM)
+}
+
+to_RM_xi <- function(x){
+  #================================================================================
+  # A function which transforms the vector of high frequency returns x into the matrix
+  # RM of covariates 1, log (1 + xi^J_t) for the tail shape specification of the R-POT model.
+  # The first row of RM corresponds to the information available on day 22 of x.
+  # 
+  # INPUTS
+  # x: the intra-day high frequency log-returns, an xts object.
+  #
+  # OUTPUTS
+  # RM: matrix of realised measures corresponding to days 22,23,...of x.
+  #================================================================================
+  # compute realised (lower) jump tail shape on monthly rolling window
+  days <- index(to.daily(x))
+  j_tail <- rep(0, length(days) - 21)
+  for(i in 1:length(j_tail)){
+    month_ret <- x[as.character(days[i:(i+21)])]
+    j_tail[i] <- J_shape(month_ret)
+  }
+  
+  Intercept <- apply.daily(x, function(x) 1)
+  Intercept <- tail(Intercept, -21)
+  time.index <- index(Intercept)
+  
+  # form the matrix of realised measures
+  m <- length(Intercept)
+  RM <- matrix(c(coredata(Intercept), j_tail), nrow = m)
+
+  RM <- xts(RM, time.index)
+  names(RM) <- c("Intercept", "xi_J")
+  return(RM)
+}
+
+GPD_loglikelihood_RPOT <- function(x, RM_xi, RM_beta, nu, kappa){
+  #================================================================================
+  # A function which computes the log-likelihood of a sample from a GPD distribution 
+  # with shapes and scales depending on the covariates RM_xi, RM_beta through:
+  # xi[i] = exp( RM_xi[i,]^T nu ) and beta[i] = exp( RM_beta[i,]^T kappa  )
+  #
+  # INPUTS
+  # x: the GPD sample. (n x 1)
+  # RM_xi: the covariates matrix for xi (xi[i] will be "regressed" on RM_xi[i,]). (n x p1)
+  # RM_beta: the covariates matrix for beta (beta[i] will be "regressed" on RM_beta[i,]). (n x p2)
+  # nu: the parameters determining the shape of the GPD distribution. (p1 x 1)
+  # kappa: the parameters determining the scale of the GPD distribution. (p2 x 1)
+  #
+  # OUTPUTS
+  # loglik: the log likelihood evaluated at x. (1 x 1)
+  #================================================================================
+  xi <- exp( RM_xi %*% nu )
+  beta <- exp( RM_beta %*% kappa )
+  # by specification of xi and beta we have xi, beta > 0
+  loglik <- sum((-1/xi-1)*log(1+xi*x/beta) - log(beta))
+  return(loglik)
+}
+
+GPD_loglikelihood_RPOT_gr <- function(x, RM_xi, RM_beta, nu, kappa){
+  #================================================================================
+  # A function which computes the gradient of the log-likelihood of a sample from a 
+  # GPD distribution with shapes and scales depending on the covariates RM through:
+  # xi[i] = exp( RM[i,]^T nu ) and beta[i] = exp( RM[i,]^T kappa  )
+  #
+  # INPUTS
+  # x: the GPD sample. (n x 1)
+  # RM_xi: the covariates matrix for xi (xi[i] will be "regressed" on RM_xi[i,]). (n x p1)
+  # RM_beta: the covariates matrix for beta (beta[i] will be "regressed" on RM_beta[i,]). (n x p2)
+  # nu: the parameters determining the shape of the GPD distribution. (p1 x 1)
+  # kappa: the parameters determining the scale of the GPD distribution. (p2 x 1)
+  #
+  # OUTPUTS
+  # loglik_gr: the log likelihood evaluated at x. (1 x 1)
+  #================================================================================
+  xi <- exp( RM_xi %*% nu )
+  beta <- exp( RM_beta %*% kappa )
+  # by specification of xi and beta we have xi, beta > 0, the derivatives are given by:
+  grad_loglik_nu <- t(1/xi*log(1 + xi/beta * x) - (xi + 1) * x/(beta + xi*x))%*%RM_xi
+  grad_loglik_kappa <- t( (xi + 1) * x / (beta + xi * x) - 1 )%*%RM_beta
+  loglik_gr <- c(grad_loglik_nu, grad_loglik_kappa)
+  return(loglik_gr)
+}
+
+RPOT_fit <- function(y, x, thresh = 0.9, RM_HAR = NULL, RM_xi = NULL){
+  #================================================================================
+  # A function which fits the R-POT model to the return sample y above the specified 
+  # threshold u with covariates computed from the high frequency observations x. 
+  # The MLE estimators for psi, nu and kappa are computed.
+  # By default the HAR-SJ specification is used for phi and beta and an affine function
+  # of the realised jump tail shape for xi. Directly provide RM's to override these settings.
+  #
+  # INPUTS
+  # y: the daily return data sample, an xts object. (n x 1)
+  # x: the high frequency observations as an xts object, starting 22 days before the first return.
+  # RM_HAR: the HAR-like realised measures starting on the day before the first return, if 
+  #         RM_HAR and RM_xi are provided then x is ignored. ((n+1) x p2)
+  # RM_xi: the realised measures on which to model the tail shape starting on the day before the
+  #        first return, if RM_HAR and RM_xi are provided then x is ignored. ((n+1) x p1)
+  # thresh: the (loss) threshold u above which to fit the GPD distribution, a high quantile of
+  #         the losses. (1 x 1)
+  #
+  # OUTPUTS
+  # RPOT_fit: a list with named components:
+  #           y: the daily returns.
+  #           thresh: the quantile threshold for the losses.
+  #           pars: a list with MLEs for psi, nu, kappa.
+  #           RM_HAR: the HAR specification realised measures starting on the day before the first
+  #                     return. ((n+1) x p2)
+  #           RM_xi: the realised measures on which to model the tail shape starting on the day
+  #                  before the first return. ((n+1) x p1)
+  #================================================================================
+  n <- length(y)
+  l <- -y
+  u <- quantile(l, thresh)
+  
+  # transform the high frequency returns into the realised measures matrix
+  if(is.null(RM_HAR)|is.null(RM_xi)){
+    RM_HAR <- to_RM_HARSJ(x)
+    RM_xi <- to_RM_xi(x)
+  }
+  
+  p1 <- ncol(RM_xi)
+  p2 <- ncol(RM_HAR)
+  
+  # if there are not enough exceedances to fit the model return error
+  if(sum(l>u) <= 10) stop("Too few exceedances: lower threshold u")
+  
+  RM_HAR.fit <- as.matrix(head(RM_HAR, -1))
+  RM_xi.fit <- as.matrix(head(RM_xi, -1))
+  # compute MLE for psi using glm function
+  i <- as.numeric(l > u)
+  logitGLM_data <- data.frame(i, RM_HAR.fit)
+  logitGLM <- summary(glm(i ~ 0 + ., family=binomial(link="logit"), data = logitGLM_data))
+  psi <- logitGLM$coefficients[,1]
+  
+  # compute MLE for GPD distribution on exceedances
+  nu_SV <- c(log(0.1), rep(0, p1-1))
+  #find starting value for kappa
+  logRV.fit <- coredata(tail(RM_HAR$RV, -1))
+  data_HARSJ <- data.frame(cbind(logRV.fit, RM_HAR.fit))
+  colnames(data_HARSJ) <- c("y", names(RM_HAR))
+  kappa_SV <- lm(y ~ 0+. , data = data_HARSJ)$coefficients
+  nu_kappa <- optim(par = c(nu_SV, kappa_SV), 
+                   fn = function(pars) 
+                     - GPD_loglikelihood_RPOT(l[l>u] - u, RM_xi = RM_xi.fit[(l>u),], 
+                                              RM_beta = RM_HAR.fit[(l>u),], nu = pars[1:p1], 
+                                              kappa = pars[(p1+1):(p1+p2)]),
+                   gr = function(pars) 
+                     - GPD_loglikelihood_RPOT_gr(l[l>u] - u, RM_xi = RM_xi.fit[(l>u),],
+                                                 RM_beta = RM_HAR.fit[(l>u),], nu = pars[1:p1], 
+                                                 kappa = pars[(p1+1):(p1+p2)]))
+  nu <- nu_kappa$par[1:p1]
+  kappa <- nu_kappa$par[(p1+1):(p1+p2)]
+  names(nu) <- names(RM_xi)
+  names(kappa) <- names(RM_HAR)
+  
+  # return results
+  return(list(
+    y = y,
+    thresh = thresh,
+    pars = list(psi = psi, nu = nu, kappa = kappa),
+    RM_HAR = RM_HAR,
+    RM_xi = RM_xi))
+}
+
+```
+
+```{r}
+RPOT_bootstrap <- function(RPOT.fit){
+  #================================================================================
+  # A function which creates a bootstrap resample of the data for fitted values of 
+  # the parameters psi, nu, kappa.
+  # 
+  # INPUTS
+  # RPOT.fit: a list with named components y, thresh, RM_HAR.fit, RM_xi, thresh, pars as 
+  #           returned by the RPOT_fit() function.
+  #
+  # OUTPUTS
+  # y_: a resample of the return data via bootstrap. (n x 1)
+  #================================================================================
+  # retrieve data and parameters from RPOT.fit object.
+  y <- RPOT.fit$y
+  l <- - coredata(y)
+  u <- quantile(l, RPOT.fit$thresh)
+  psi <- RPOT.fit$pars$psi
+  nu <- RPOT.fit$pars$nu
+  kappa <- RPOT.fit$pars$kappa
+  RM_HAR.fit <- coredata(head(RPOT.fit$RM_HAR, -1))
+  RM_xi.fit <- coredata(head(RPOT.fit$RM_xi, -1))
+  
+  # fitted parameters
+  phi <- exp( RM_HAR.fit%*%psi )/(1 + exp( RM_HAR.fit%*%psi ))
+  xi <- exp( RM_xi.fit%*%nu )
+  beta <- exp( RM_HAR.fit%*%kappa )
+  
+  # compute exceedence residuals
+  r <- 1/xi[l>u] * log(1 + xi[l>u]/beta[l>u] * (l[l>u]-u) )
+  
+  # bootstrap losses
+  n <- length(y)
+  l_ <- rep(0, n)
+
+  # simulate exceedances
+  i <- (runif(n) < phi )
+  # if exceedance has occured simulate exceedance residual and post-blacken
+  l_[i] <- u + beta[i]/xi[i] * ( exp(xi[i]* sample(r, sum(i), replace = TRUE)) - 1)
+  # if exceedance has not occured simulate from the empirical distribution 
+  # function of values below u
+  l_[!i] <- sample(l[l<=u], sum(!i), replace = TRUE)
+  # go back to returns
+  y_ <- xts(-l_, order.by = index(y))
+  
+  return(y_)
+}
+
+RPOT_bootstrapCIs <- function(RPOT.fit, conf.level = 0.95, boot = 500){
+  #================================================================================
+  # A function which computes the bootstrap confidence intervals for the parameters 
+  # of the R-POT model.
+  # 
+  # INPUTS
+  # RPOT.fit: a list with named components y, thresh, RM_HAR.fit, RM_xithresh, pars as 
+  #           returned by the RPOT_fit() function.
+  #
+  # OUTPUTS
+  # pars_CIs: a list with named components:
+  #           psi, nu, kappa: dataframes containing the CIs.
+  #================================================================================
+  # initialise matrices to contain bootstrap samples (each row corresponds to a new sample)
+  psi_boot <- c()
+  kappa_boot <- c()
+  nu_boot <- c()
+  
+  b <- 0
+  suppressWarnings({
+      while(b < boot){
+        # form a new bootstrap sample
+        y_ <- RPOT_bootstrap(RPOT.fit)
+    
+        # fit the HAR-EVT model to the new sample
+        flag <- FALSE
+        tryCatch(RPOT.boot <- RPOT_fit(y = y_, x = NULL, RM_HAR = RPOT.fit$RM_HAR, 
+                                       RM_xi = RPOT.fit$RM_xi, thresh = RPOT.fit$thresh), 
+                 error = function(e) flag <- TRUE)
+        if(flag) next
+    
+        # retain the fitted parameters
+        psi_boot <- rbind(psi_boot, RPOT.boot$pars$psi)
+        nu_boot <- rbind(nu_boot, RPOT.boot$pars$nu)
+        kappa_boot <- rbind(kappa_boot, RPOT.boot$pars$kappa)
+        
+        b <- nrow(psi_boot)
+        }
+    })
+  
+  # probability
+  alpha <- 1 - conf.level
+  
+  # compute the confidence intervals using the empirical distribution for the parameters
+  # obtain through bootstrapping
+  psi_CI <- apply(psi_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  nu_CI <- apply(nu_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  kappa_CI <- apply(kappa_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  
+  # return the bootstrap confidence intervals
+  return(list(psi_CI = psi_CI, nu_CI = nu_CI, kappa_CI = kappa_CI))
+}
+
+RPOT_tails <- function(RPOT.fit, VaR.level = 0.95, predict = TRUE, 
+                       CIs = TRUE, conf.level = 0.95, boot = 500){
+  #================================================================================
+  # A function which carries out tail inference using the HAR-EVT model. 
+  # If predict = TRUE tail inference is performed 1-period ahead. 
+  # If predict = FALSE tail inference is performed for the periods corresponding to data y. 
+  # For each period in consideration the (VaR, xi, beta) triplet is estimated. Further,
+  # if CIs = TRUE, bootstrapping is used in order to compute confidence intervals for 
+  # the tail risk measures.
+  #
+  # INPUTS
+  # RPOT.fit: a list with named components y, thresh, RM_HAR.fit, RM_xithresh, pars as 
+  #           returned by the RPOT_fit() function.
+  # VaR.level: the level at which to compute VaR. (1 x 1)
+  # predict: logical indicating whether to perform forward or backward tail inference. 
+  # CIs: logical indicating whether to compute bootstrap CIs.
+  # conf.level: confidence level for the confidence intervals of the estimates. (1 x 1)
+  # boot: the number of bootstrap resamples to use. (1 x 1)
+  #
+  # OUTPUTS
+  # tail.risk: a named list with components:
+  #            risk.meas: a dataframe containing the tail risk triplets with named columns.
+  #                       (1 x 3) or (n x 3)
+  #            risk.meas_CI: a dataframe containing the tail risk triplets CIs with named 
+  #                          columns. (1 x 6) or (n x 6)
+  #================================================================================
+  # retrieve the parameters from the RPOT.fit object
+  psi <- RPOT.fit$pars$psi
+  nu <- RPOT.fit$pars$nu
+  kappa <- RPOT.fit$pars$kappa
+  u <- quantile(-RPOT.fit$y, RPOT.fit$thresh)
+  RM_HAR <- RPOT.fit$RM_HAR
+  RM_xi <- RPOT.fit$RM_xi
+  
+  # if predict = TRUE compute 1-day ahead risk-measures
+  if(predict){
+    # "predict" the one-day ahead phi, xi, beta
+    phi <- exp(tail(RM_HAR, 1) %*% psi) / (1 + exp(tail(RM_HAR, 1) %*% psi))
+    xi <- exp(tail(RM_xi, 1) %*% nu)
+    beta <- exp(tail(RM_HAR, 1) %*% kappa)
+  }
+  # if predict = FALSE compute risk measures on past data
+  else{
+    # retrieve the fitted conditional volatilities
+    RM_HAR.fit <- head(RM_HAR, -1)
+    RM_xi.fit <- head(RM_xi, -1)
+    phi <- exp( RM_HAR.fit %*% psi) / (1 + exp(RM_HAR.fit %*% psi))
+    xi <- exp( RM_xi.fit %*% nu )
+    beta <- exp( RM_HAR.fit %*% kappa )
+  }
+  
+  # compute VaR at level VaR.level
+  alpha.VaR <- 1 - VaR.level
+  VaR <- rep(0, length(phi))
+  VaR[alpha.VaR <= phi] <- u + beta[alpha.VaR <= phi]/xi[alpha.VaR <= phi] * 
+    ( (phi[alpha.VaR <= phi]/alpha.VaR)^xi[alpha.VaR <= phi] - 1 )
+  VaR[alpha.VaR > phi] <- NA
+    
+  # tail risk measures
+  VaR.name <- paste0(VaR.level,"-VaR")
+  risk.meas <- data.frame(VaR, xi, beta)
+  colnames(risk.meas) <- c(VaR.name, "xi", "beta")
+  risk.meas_CI <- NA
+  
+  if(CIs){
+    # initialise matrices to contain bootstrap samples (each column
+    # corresponds to a new sample)
+    b <- 0
+    VaR_boot <- c()
+    xi_boot <- c()
+    beta_boot <- c()
+    
+    suppressWarnings({
+      while(b < boot){
+        # form a new bootstrap sample
+        y_ <- RPOT_bootstrap(RPOT.fit)
+    
+        # fit the HAR-EVT model to the new sample
+        flag <- FALSE
+        tryCatch(RPOT.boot <- RPOT_fit(y = y_, x = NULL, RM_HAR = RM_HAR, RM_xi = RM_xi, 
+                                             thresh = RPOT.fit$thresh), 
+                 error = function(e) flag <- TRUE)
+        if(flag) next
+      
+        # compute tail risk measures on bootstrap sample
+        tail_boot <- RPOT_tails(RPOT.boot, VaR.level = VaR.level, predict = predict, 
+                                CIs = FALSE)$risk.meas
+
+        VaR_boot <- cbind(VaR_boot, tail_boot[,VaR.name])
+        xi_boot <- cbind(xi_boot, tail_boot$xi) 
+        beta_boot <- cbind(beta_boot, tail_boot$beta)
+      
+        b <- ncol(VaR_boot)
+      
+      }
+    })
+  
+    # probability
+    alpha.CI <- 1 - conf.level
+  
+    # compute the confidence intervals using the empirical distribution for the risk measures
+    # obtain through bootstrapping
+    quant_fun <- function(x) quantile(x, probs = c(alpha.CI/2, 1 - alpha.CI/2), na.rm = TRUE)
+    VaR_CI <- apply(VaR_boot, 1, quant_fun)
+    xi_CI <- apply(xi_boot, 1, quant_fun)
+    beta_CI <- apply(beta_boot, 1, quant_fun)
+    
+    # tail risk measures confidence intervals
+    risk.meas_CI <- data.frame(t(rbind(VaR_CI, xi_CI, beta_CI)))
+    colnames(risk.meas_CI) <- paste0(c(paste0(VaR.name, c(".lower.", ".upper.")), 
+                                       "xi.lower.", "xi.upper.", 
+                                       "beta.lower.", "beta.upper."), conf.level)
+  }
+  return(list(risk.meas = risk.meas, risk.meas_CI = risk.meas_CI))
+}
+```
+
+# Comparing the models
+
+We first assess the fit of the models over the whole period of data we have access to.
+The HAR-EVT and R-POT model require to discard the first month of close-to-close returns and hence for consistency we do the same also for the C-EVT model.
+
+```{r}
+# Fit each model and report table with parameter estimates and confidence intervals
+CEVT.fit <- CEVT_fit(SPY.dailyreturns)
+suppressWarnings({HAR.EVT.fit <- HAR.EVT_fit(SPY.dailyreturns, SPY.HF)})
+suppressWarnings({RPOT.fit <- RPOT_fit(SPY.dailyreturns, SPY.HF)})
+```
+```{r}
+# retrieve parameter values
+CEVT.pars <- cbind(t(data.frame(coef(CEVT.fit$GARCH.fit))), CEVT.fit$tail.pars)
+rownames(CEVT.pars) <- NULL
+HAR.EVT.pars <- cbind(data.frame(HAR.EVT.fit$beta.HAR), HAR.EVT.fit$tail.pars)
+rownames(HAR.EVT.pars) <- NULL
+RPOT.pars <- data.frame(cbind(t(RPOT.fit$pars$psi), t(RPOT.fit$pars$nu), t(RPOT.fit$pars$kappa)))
+names(RPOT.pars) <- c(paste0("psi_", names(RPOT.fit$pars$psi)),
+                      paste0("nu_", names(RPOT.fit$pars$nu)),
+                      paste0("kappa_", names(RPOT.fit$pars$kappa)))
+# compute confidence intervals for parameters
+set.seed(12345)
+CEVT.pars_CIs <- CEVT_bootstrapCIs(CEVT.fit)
+HAR.EVT.pars_CIs <- HAR.EVT_bootstrapCIs(HAR.EVT.fit)
+RPOT.pars_CIs <- RPOT_bootstrapCIs(RPOT.fit)
+```
+
+```{r}
+# display results in tables
+CEVT.pars_CIs_df <- cbind(CEVT.pars_CIs$GARCH.pars_CI, CEVT.pars_CIs$xi_CI,
+                          CEVT.pars_CIs$beta_CI)
+colnames(CEVT.pars_CIs_df) <- names(CEVT.pars[,-4])
+CEVT.pars.df <- t(rbind(CEVT.pars[,-4], CEVT.pars_CIs_df))
+kable(CEVT.pars.df)
+
+HAR.EVT.pars_CIs_df <- cbind(HAR.EVT.pars_CIs$beta.HAR_CI, HAR.EVT.pars_CIs$xi_CI,
+                             HAR.EVT.pars_CIs$beta_CI)
+colnames(HAR.EVT.pars_CIs_df) <- names(HAR.EVT.pars[,-6])
+HAR.EVT.pars.df <- t(rbind(HAR.EVT.pars[,-6], HAR.EVT.pars_CIs_df))
+kable(HAR.EVT.pars.df)
+
+RPOT.pars_CIs_df <- cbind(RPOT.pars_CIs$psi_CI, RPOT.pars_CIs$nu_CI,
+                          RPOT.pars_CIs$kappa_CI)
+colnames(RPOT.pars_CIs_df) <- names(RPOT.pars)
+RPOT.pars.df <- t(rbind(RPOT.pars, RPOT.pars_CIs_df))
+kable(RPOT.pars.df)
+```
+
+```{r}
+# estimate in-sample risk measures and their CIs
+set.seed(12345)
+CEVT.tail <- CEVT_tails(CEVT.fit, predict = FALSE, VaR.level = 0.99)
+HAR.EVT.tail <- HAR.EVT_tails(HAR.EVT.fit, predict = FALSE, VaR.level = 0.99)
+RPOT.tail <- RPOT_tails(RPOT.fit, predict = FALSE, VaR.level = 0.99)
+```
+```{r}
+# CEVT in-sample tail fit
+df_plot <- data.frame(SPY.dailyreturns,
+                      VaR = CEVT.tail$risk.meas$`0.99-VaR`,
+                      VaR.lower = CEVT.tail$risk.meas_CI$`0.99-VaR.lower.0.95`,
+                      VaR.upper = CEVT.tail$risk.meas_CI$`0.99-VaR.upper.0.95`,
+                      xi = CEVT.tail$risk.meas$xi,
+                      xi.lower = CEVT.tail$risk.meas_CI$xi.lower.0.95,
+                      xi.upper = CEVT.tail$risk.meas_CI$xi.upper.0.95,
+                      beta = CEVT.tail$risk.meas$beta,
+                      beta.lower = CEVT.tail$risk.meas_CI$beta.lower.0.95,
+                      beta.upper = CEVT.tail$risk.meas_CI$beta.upper.0.95)
+
+p_VaR <- ggplot(df_plot, aes(x = index(SPY.dailyreturns))) + 
+  geom_line(aes(y = x), size = 0.3, col = "skyblue4") +
+  geom_line(aes(y = -VaR), size = 0.3) + 
+  geom_ribbon(aes(ymin = -VaR.upper, ymax = -VaR.lower), alpha = 0.3) +
+  ylab("S&P500 returns with 99% VaR") + xlab("")
+
+p_xi <- ggplot(df_plot, aes(x = index(SPY.dailyreturns))) +
+  geom_line(aes(y = xi), size = 0.3) + 
+  geom_ribbon(aes(ymin = xi.lower, ymax = xi.upper), alpha = 0.3) +
+  ylim(c(-1, 1)) +
+  ylab(expression(paste("tail shape ", xi))) + xlab("")
+
+p_beta <- ggplot(df_plot, aes(x = index(SPY.dailyreturns))) +
+  geom_line(aes(y = beta), size = 0.3) + 
+  geom_ribbon(aes(ymin = beta.lower, ymax = beta.upper), alpha = 0.3) +
+  ylab(expression(paste("tail scale ", beta)))  + xlab("")
+
+
+p <- plot_grid(p_VaR, p_xi, p_beta, nrow = 3)
+
+p
+
+save_plot("Thesis plots/CEVT_insample_tails.jpg", p, nrow = 3, dpi = 600, limitsize = FALSE)
+
+cat("99%-VaR violations = ", sum(SPY.dailyreturns < - CEVT.tail$risk.meas$`0.99-VaR`),
+    "/", length(SPY.dailyreturns))
+```
+
+
+
+```{r}
+# HAR-EVT in-sample tail fit
+df_plot <- data.frame(SPY.dailyreturns,
+                      VaR = HAR.EVT.tail$risk.meas$`0.99-VaR`,
+                      VaR.lower = HAR.EVT.tail$risk.meas_CI$`0.99-VaR.lower.0.95`,
+                      VaR.upper = HAR.EVT.tail$risk.meas_CI$`0.99-VaR.upper.0.95`,
+                      xi = HAR.EVT.tail$risk.meas$xi,
+                      xi.lower = HAR.EVT.tail$risk.meas_CI$xi.lower.0.95,
+                      xi.upper = HAR.EVT.tail$risk.meas_CI$xi.upper.0.95,
+                      beta = HAR.EVT.tail$risk.meas$beta,
+                      beta.lower = HAR.EVT.tail$risk.meas_CI$beta.lower.0.95,
+                      beta.upper = HAR.EVT.tail$risk.meas_CI$beta.upper.0.95)
+
+p_VaR <- ggplot(df_plot, aes(x = index(SPY.dailyreturns))) + 
+  geom_line(aes(y = x), size = 0.3, col = "skyblue4") +
+  geom_line(aes(y = -VaR), size = 0.3) + 
+  geom_ribbon(aes(ymin = -VaR.upper, ymax = -VaR.lower), alpha = 0.3) +
+  ylab("S&P500 returns with 99% VaR") + xlab("")
+
+p_xi <- ggplot(df_plot, aes(x = index(SPY.dailyreturns))) +
+  geom_line(aes(y = xi), size = 0.3) + 
+  geom_ribbon(aes(ymin = xi.lower, ymax = xi.upper), alpha = 0.3) +
+  ylim(c(-1, 1)) +
+  ylab(expression(paste("tail shape ", xi))) + xlab("")
+
+p_beta <- ggplot(df_plot, aes(x = index(SPY.dailyreturns))) +
+  geom_line(aes(y = beta), size = 0.3) + 
+  geom_ribbon(aes(ymin = beta.lower, ymax = beta.upper), alpha = 0.3) +
+  ylab(expression(paste("tail scale ", beta)))  + xlab("")
+
+
+p <- plot_grid(p_VaR, p_xi, p_beta, nrow = 3)
+
+p
+
+save_plot("HAR.EVT_insample_tails.jpg", p, nrow = 3, dpi = 600, limitsize = FALSE)
+
+cat("99%-VaR violations = ", sum(SPY.dailyreturns < - HAR.EVT.tail$risk.meas$`0.99-VaR`),
+    "/", length(SPY.dailyreturns))
+```
+
+
+
+```{r}
+# RPOT in-sample tail fit
+df_plot <- data.frame(SPY.dailyreturns,
+                      VaR = RPOT.tail$risk.meas$`0.99-VaR`,
+                      VaR.lower = RPOT.tail$risk.meas_CI$`0.99-VaR.lower.0.95`,
+                      VaR.upper = RPOT.tail$risk.meas_CI$`0.99-VaR.upper.0.95`,
+                      xi = RPOT.tail$risk.meas$xi,
+                      xi.lower = RPOT.tail$risk.meas_CI$xi.lower.0.95,
+                      xi.upper = RPOT.tail$risk.meas_CI$xi.upper.0.95,
+                      beta = RPOT.tail$risk.meas$beta,
+                      beta.lower = RPOT.tail$risk.meas_CI$beta.lower.0.95,
+                      beta.upper = RPOT.tail$risk.meas_CI$beta.upper.0.95)
+
+p_VaR <- ggplot(df_plot, aes(x = index(SPY.dailyreturns))) + 
+  geom_line(aes(y = x), size = 0.3, col = "skyblue4") +
+  geom_line(aes(y = -VaR), size = 0.3) + 
+  geom_ribbon(aes(ymin = -VaR.upper, ymax = -VaR.lower), alpha = 0.3) +
+  ylab("S&P500 returns with 99% VaR") + xlab("") +
+  coord_cartesian(ylim = c(-0.5, 0.1))
+
+p_xi <- ggplot(df_plot, aes(x = index(SPY.dailyreturns))) +
+  geom_line(aes(y = xi), size = 0.3) + 
+  geom_ribbon(aes(ymin = xi.lower, ymax = xi.upper), alpha = 0.3) +
+  ylim(c(0, 0.25)) +
+  ylab(expression(paste("tail shape ", xi))) + xlab("")
+
+p_beta <- ggplot(df_plot, aes(x = index(SPY.dailyreturns))) +
+  geom_line(aes(y = beta), size = 0.3) + 
+  geom_ribbon(aes(ymin = beta.lower, ymax = beta.upper), alpha = 0.3) +
+  ylab(expression(paste("tail scale ", beta, " (log scale)")))  + xlab("") +
+  scale_y_continuous(trans = "log", labels = scales::label_number())
+
+
+p <- plot_grid(p_VaR, p_xi, p_beta, nrow = 3)
+
+p
+
+save_plot("RPOT_insample_tails.jpg", p, nrow = 3, dpi = 600, limitsize = FALSE)
+
+cat("99%-VaR violations = ", sum(SPY.dailyreturns < - RPOT.tail$risk.meas$`0.99-VaR`),
+    "/", length(SPY.dailyreturns))
+```
+
+```{r}
+# OUT-OF-SAMPLE
+
+# pre-compute realised measures for efficiency
+RM_HARJ <- to_RM_HARJ(SPY.HF)
+suppressWarnings({RM_xi <- to_RM_xi(SPY.HF)})
+RM_HARSJ <- to_RM_HARSJ(SPY.HF)
+```
+
+```{r}
+# Plot the realised tail jump shape (computed on rolling monthly window)
+jump.xi <- RM_xi$xi_J
+
+p <- ggplot(jump.xi, aes(x = Index)) + geom_line(aes(y = xi_J)) +
+  ggtitle("S&P 500 realised jump tail shape (monthly rolling window)") +
+  ylab(expression(xi[J])) + xlab("") +
+  theme(plot.title = element_text(hjust = 0.5))
+p
+
+save_plot("Thesis plots/xijump.jpg", p, dpi = 600, limitsize = FALSE)
+```
+
+```{r}
+# parameters for out-of-sample analysis
+# REM: a trading year is 252 days
+window <- 400 
+T. <- length(SPY.dailyreturns)
+SPY.dailyreturns.test <- tail(SPY.dailyreturns, T. - window)
+alpha <- 0.01
+tail.forecasts_CEVT <- xts(matrix(rep(0, 3*(T. - window)), nrow = (T. - window)), 
+                           order.by = index(SPY.dailyreturns.test))
+tail.forecasts_HAR.EVT <- xts(matrix(rep(0, 3*(T. - window)), nrow = (T. - window)), 
+                              order.by = index(SPY.dailyreturns.test))
+tail.forecasts_RPOT <- xts(matrix(rep(0, 3*(T. - window)), nrow = (T. - window)), 
+                           order.by = index(SPY.dailyreturns.test))
+thresh_CEVT <- rep(0, T. - window)
+thresh_HAR.EVT <- rep(0, T. - window)
+thresh_RPOT <- rep(0, T. - window)
+```
+```{r}
+# out of sample forecasts
+for(i in 1:(T. - window)){
+  # select returns and RMs
+  SPY.dailyreturns_ <- SPY.dailyreturns[i:(window-1+i)]
+  RM_HARJ_ <- RM_HARJ[i:(window+i),]
+  RM_xi_ <- RM_xi[i:(window+i),]
+  RM_HARSJ_ <- RM_HARSJ[i:(window+i),]
+  # fit the models
+  CEVT.fit_ <- CEVT_fit(SPY.dailyreturns_)
+  HAR.EVT.fit_ <- HAR.EVT_fit(SPY.dailyreturns_, x = NULL, RM = RM_HARJ_)
+  RPOT.fit_ <- RPOT_fit(SPY.dailyreturns_, x = NULL, RM_HAR = RM_HARSJ_, RM_xi = RM_xi_)
+  # compute VaR_alpha, xi and beta forecasts
+  CEVT.tail.forecast <- CEVT_tails(CEVT.fit_, predict = TRUE,
+                                   CIs = FALSE, VaR.level = 0.99)$risk.meas
+  HAR.EVT.tail.forecast <- HAR.EVT_tails(HAR.EVT.fit_, predict = TRUE, 
+                                         CIs = FALSE, VaR.level = 0.99)$risk.meas
+  RPOT.tail.forecast <- RPOT_tails(RPOT.fit_, predict = TRUE,
+                                   CIs = FALSE, VaR.level = 0.99)$risk.meas
+  # store tail risk measures (and tail threshold)
+  tail.forecasts_CEVT[i,] <- as.numeric(CEVT.tail.forecast)
+  tail.forecasts_HAR.EVT[i,] <- as.numeric(HAR.EVT.tail.forecast)
+  tail.forecasts_RPOT[i,] <- as.numeric(RPOT.tail.forecast)
+  thresh_CEVT[i] <- CEVT.fit_$u * CEVT.tail.forecast$beta/CEVT.fit_$tail.pars$beta
+  thresh_HAR.EVT[i] <- HAR.EVT.fit_$u * HAR.EVT.tail.forecast$beta/HAR.EVT.fit_$tail.pars$beta
+  thresh_RPOT[i] <- quantile(-RPOT.fit_$y, RPOT.fit_$thresh)
+}
+
+# re-name forecast dataframes
+names(tail.forecasts_CEVT) <- names(CEVT.tail.forecast)
+names(tail.forecasts_HAR.EVT) <- names(HAR.EVT.tail.forecast)
+names(tail.forecasts_RPOT) <- names(RPOT.tail.forecast)
+```
+
+```{r}
+# Kupiec's POF test and Christoffersen's Markov tests for VaR backtesting
+
+POF_test <- function(exceedances, alpha){
+  #================================================================================
+  # Function which computes the p-value of Kupiec's proportion of failures test for a
+  # violations sequence exceedances and VaR level alpha.
+  #
+  # INPUTS
+  # exceedances: sequence of violations, either logicals or 0's and 1's. (N x 1)
+  # alpha: expected VaR level. (1 x 1)
+  #
+  # OUTPUTS
+  # p_val: p value of POF test. (1 x 1)
+  #================================================================================
+  alpha.hat <- mean(exceedances)
+  N <- length(exceedances)
+  n <- sum(exceedances)
+  POF <- -2*log( ( (1-alpha)/(1-alpha.hat) )^(N-n) * ( alpha/alpha.hat )^n )
+  p_val <- pchisq(POF, df = 1, lower.tail = FALSE)
+  return(p_val)
+}
+
+Markov_test <- function(exceedances, alpha){
+  #================================================================================
+  # Function which computes the p-value of Christofferesen's Markov test for a
+  # violations sequence exceedances and VaR level alpha.
+  #
+  # INPUTS
+  # exceedances: sequence of violations, either logicals or 0's and 1's. (N x 1)
+  # alpha: expected VaR level. (1 x 1)
+  #
+  # OUTPUTS
+  # p_val: p value of Markov test. (1 x 1)
+  #================================================================================
+  N_00 <- sum((head(exceedances, -1) == 0) & (tail(exceedances, -1) == 0))
+  N_01 <- sum((head(exceedances, -1) == 0) & (tail(exceedances, -1) == 1))
+  N_10 <- sum((head(exceedances, -1) == 1) & (tail(exceedances, -1) == 0))
+  N_11 <- sum((head(exceedances, -1) == 1) & (tail(exceedances, -1) == 1))
+  N <- N_00 + N_01 + N_10 + N_11
+  pi_0 <- N_01 / (N_00 + N_01)
+  pi_1 <- N_11 / (N_10 + N_11)
+  pi <- (N_01 + N_11) / N
+  LR <- - 2*log( ( (1-pi)^(N_00 + N_01) * (pi)^(N_01 + N_11) ) /
+                   ( (1-pi_0)^N_00 * pi_0^N_01 * (1-pi_1)^N_10 * pi_1^N_11 ) )
+  p_val <- pchisq(LR, df = 1, lower.tail = FALSE)
+  return(p_val)
+}
+
+# Compute p-values of test and display in table
+expected_exceedances <- (T. - window) * alpha
+
+CEVT.exceedances <- coredata(SPY.dailyreturns.test < - tail.forecasts_CEVT$`0.99-VaR`)
+POF_pvalue_CEVT <- POF_test(CEVT.exceedances, alpha = alpha)
+Markov_pvalue_CEVT <- Markov_test(CEVT.exceedances)
+
+HAR.EVT.exceedances <- coredata(SPY.dailyreturns.test < -tail.forecasts_HAR.EVT$`0.99-VaR`)
+POF_pvalue_HAR.EVT <- POF_test(HAR.EVT.exceedances, alpha = alpha)
+Markov_pvalue_HAR.EVT <- Markov_test(HAR.EVT.exceedances)
+
+RPOT.exceedances <- coredata(SPY.dailyreturns.test < - tail.forecasts_RPOT$`0.99-VaR`)
+POF_pvalue_RPOT <- POF_test(RPOT.exceedances, alpha = alpha)
+Markov_pvalue_RPOT <- Markov_test(RPOT.exceedances)
+
+df.results <- data.frame(rep(expected_exceedances, 3), 
+                         c(sum(CEVT.exceedances), sum(HAR.EVT.exceedances), sum(RPOT.exceedances)), 
+                         c(POF_pvalue_CEVT, POF_pvalue_HAR.EVT, POF_pvalue_RPOT),
+                         c(Markov_pvalue_CEVT, Markov_pvalue_HAR.EVT, Markov_pvalue_RPOT))
+colnames(df.results) <- c("Expected Exceedances", "Actual Exceedances", "POF test (p value)", 
+                          "Markov test (p value)")
+kable(t(df.results), 
+      col.names = c("CEVT", "HAR-EVT", "RPOT"),
+      digits = 2)
+```
+
+
+```{r}
+# out-of-sample tail fit
+exp.residuals <- function(y, tails, thresh){
+  #=================================================================================
+  # A function which computes the exponential residuals for the lower tails of the
+  # return process x.
+  #
+  # INPUTS
+  # y: the return process. (n x 1)
+  # tails: the (forecasted) tail parameters of y, attributes xi and beta of GPD distribution. (n x 2)
+  # thres: the loss threshold above which the GPD characterisation holds. (n x 1)
+  #
+  # OUTPUTS
+  # residuals: the GPD residuals for the exceedances of the loss threshold u.
+  #=================================================================================
+  # compute losses and identify exceedances
+  l <- - y
+  exceedances <- l > thresh
+  residuals <- rep(0, sum(exceedances))
+  xi <- tails$xi[exceedances]
+  beta <- tails$beta[exceedances]
+  thresh <- thresh[exceedances]
+  l <- l[exceedances]
+  ind <- abs(xi) > 1e-14
+  residuals[ind] <- 1/xi[ind] *  log(1 + xi[ind] / beta[ind] *(l[ind]  - thresh[ind]) )
+  residuals[!ind] <- (l[!ind] - thresh[!ind]) / beta[!ind]
+  return(residuals)
+}
+
+# qqplots of residuals against exp(1) distribution
+CEVT.residuals <- exp.residuals(SPY.dailyreturns.test, tail.forecasts_CEVT, thresh_CEVT)
+qqCEVT <- qplot(sample = CEVT.residuals, geom = "blank") + 
+  stat_qq(distribution = qexp) + xlab("Theoretical quantiles") +
+  ylab("Sample quantiles") + geom_abline(slope = 1, intercept = 0, lty = "dashed") +
+  ggtitle("C-EVT residuals")
+
+HAR.EVT.residuals <- exp.residuals(SPY.dailyreturns.test, tail.forecasts_HAR.EVT, thresh_HAR.EVT)
+qqHAR.EVT <- qplot(sample = HAR.EVT.residuals, geom = "blank") +
+  stat_qq(distribution = qexp) + xlab("Theoretical quantiles") +
+  ylab("Sample quantiles") + geom_abline(slope = 1, intercept = 0, lty = "dashed") +
+  ggtitle("HAR-EVT residuals")
+
+RPOT.residuals <- exp.residuals(SPY.dailyreturns.test, tail.forecasts_RPOT, thresh_RPOT)
+RPOT.residuals <- RPOT.residuals[-which.max(RPOT.residuals)]
+qqRPOT <- qplot(sample = RPOT.residuals, geom = "blank") +
+  stat_qq(distribution = qexp) + xlab("Theoretical quantiles") +
+  ylab("Sample quantiles") + geom_abline(slope = 1, intercept = 0, lty = "dashed") +
+  ggtitle("RPOT residuals")
+
+p <- plot_grid(qqCEVT, qqHAR.EVT, qqRPOT, nrow = 3)
+
+p
+
+save_plot("Exponential_residuals.jpg", p, nrow = 3, dpi = 600, limitsize = FALSE)
+
+# KS tests of residuals against exp(1) distribution
+ks.test(CEVT.residuals, y = pexp)
+ks.test(HAR.EVT.residuals, y = pexp)
+ks.test(RPOT.residuals, y = pexp)
+```
