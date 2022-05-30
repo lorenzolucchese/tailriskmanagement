@@ -1,5 +1,5 @@
 ---
-title: "Tail Risk Management"
+title: "Tail Risk Management - CPOT simulation"
 author: "Lorenzo Lucchese"
 date: "07/03/2021"
 output:
@@ -18,6 +18,269 @@ library(cowplot)
 library(grid)
 library(gridExtra)
 library(highfrequency)
+```
+
+## C-POT model
+We model the tails of the time series $\{X_t, t\in\mathbb{Z}\}$ conditional on the filtration $(\mathcal{F}_t)_t$ by:
+\begin{align*}
+	\mathbb{P}(X_t>x|\mathcal{F}_{t-1}) &= \mathbb{P}(X_t>x|X_t\geq u, \mathcal{F}_{t-1})\mathbb{P}(X_t\geq u|\mathcal{F}_{t-1}) = \\
+	& = (1-F^u_{t|t-1}(x-u))(1-F_{t|t-1}(u)) = \\
+	& \approx \phi_{t|t-1} \Big(1 + \xi_{t|t-1} \frac{x-u}{\beta_{t|t-1}}\Big)^{-1/\xi_{t|t-1}}.
+\end{align*}
+
+We specify separate dynamic models for $\phi_{t|t-1}$ and GPD parameters $\xi_{t|t-1},\beta_{t|t-1}$:
+\begin{itemize}
+	\item We consider a Logit Binomial GLM for the exceedances, $I_t=1_{\{X_t\geq u\}}$, with covariates $\boldsymbol{RM}_{t-1}$:
+	\begin{align*}
+		\mathbb{P}(I_t=i|\mathcal{F}_{t-1}) &= \phi_{t|t-1}^i(1-\phi_{t|t-1})^{1-i} \qquad i\in\{0,1\}\\
+		\phi_{t|t-1} &= \textrm{logit}^{-1}(\boldsymbol{\psi}^T\boldsymbol{RM}_{t-1})
+	\end{align*}
+	i.e. $I_t|\mathcal{F}_{t-1}\sim Bernoulli(\phi_{t|t-1})$ where $\boldsymbol{\psi} = [\psi_0,\psi_1,\ldots, \psi_p]$ and $\boldsymbol{RM}_{t-1} = [1,RM_{t-1}^1,\ldots, RM_{t-1}^p]$.
+	
+	\item We model $F^u_{t|t-1}$ as a GPD distribution with time varying shape and scale parameters 
+	\begin{align*}
+		\xi_{t|t-1} &= \exp(\boldsymbol{RM}_{t-1}^T\boldsymbol{\nu}) \\
+		\beta_{t|t-1} &= \exp(\boldsymbol{RM}_{t-1}^T\boldsymbol{\kappa})
+	\end{align*}
+	where $\boldsymbol{\nu} = [\nu_0,\nu_1,\ldots, \nu_p]$, $\boldsymbol{\kappa} = [\kappa_0,\kappa_1,\ldots, \kappa_p]$ and $\boldsymbol{RM}_{t-1} = [1,RM_{t-1}^1,\ldots, RM_{t-1}^p]$. Here we are hence modelling $X_t-u|\mathcal{F}_{t-1},I_t=1$ as a GPD distribution with parameters $\xi_{t|t-1}$ and $\beta_{t|t-1}$.
+\end{itemize}
+
+The MLEs for the parameters are given by:
+\begin{align*}
+	\boldsymbol{\hat\psi} &=  \underset{\boldsymbol{\psi}\in \Psi}{\text{argmax}} \frac{1}{n} \sum_{t=1}^n\bigg\{ i_t\log\big(\textrm{logit}^{-1}(\boldsymbol{\psi^T\boldsymbol{RM}_{t-1}})\big) + (1-i_t)\log\big(1-\textrm{logit}^{-1}(\boldsymbol{\psi}^T\boldsymbol{RM}_{t-1})\big)\bigg\}\\
+	(\boldsymbol{\hat\nu},\boldsymbol{\hat\kappa}) &= \underset{(\boldsymbol{\nu},\boldsymbol{\kappa})\in N\times K}{\text{argmax}} \frac{1}{n} \sum_{t=1}^n \bigg\{i_t \log\Big(g_{\exp\{\boldsymbol{\nu}^T\boldsymbol{RM}_{t-1}\}), \exp\{\boldsymbol{\kappa}^T\boldsymbol{RM}_{t-1}\}}(x_t)\Big)\bigg\}
+\end{align*}
+We note that the first estimator is the MLE of a Binomial GLM with logit link function.
+
+
+```{r}
+GPD_loglikelihood_CPOT <- function(x, RM, nu, kappa){
+  #================================================================================
+  # A function which computes the log-likelihood of a sample from a GPD distribution 
+  # with shapes and scales depending on the covariates RM through:
+  # xi[i] = exp( RM[i,]^T nu ) and beta[i] = exp( RM[i,]^T kappa  )
+  #
+  # INPUTS
+  # x: the GPD sample. (n x 1)
+  # RM: the covariates matrix (xi[i], beta[i] will be "regressed" on RM[i,]). (n x p)
+  # nu: the parameters determining the shape of the GPD distribution. (p x 1)
+  # kappa: the parameters determining the scale of the GPD distribution. (p x 1)
+  #
+  # OUTPUTS
+  # loglik: the log likelihood evaluated at x. (1 x 1)
+  #================================================================================
+  xi <- exp( RM %*% nu )
+  beta <- exp( RM %*% kappa )
+  # by specification of xi and beta we have xi, beta > 0
+  loglik <- sum((-1/xi-1)*log(1+xi*x/beta) - log(beta))
+  return(loglik)
+}
+
+GPD_loglikelihood_CPOT_gr <- function(x, RM, nu, kappa){
+  #================================================================================
+  # A function which computes the gradient of the log-likelihood of a sample from a 
+  # GPD distribution with shapes and scales depending on the covariates RM through:
+  # xi = exp( RM[t,]^T nu ) and beta = exp( RM[t,]^T kappa  )
+  #
+  # INPUTS
+  # x: the GPD sample. (n x 1)
+  # RM: the covariates matrix (x[t] will be "regressed" on RM[t,]). (n x p)
+  # nu: the parameters determining the shape of the GPD distribution. (p x 1)
+  # kappa: the parameters determining the scale of the GPD distribution. (p x 1)
+  #
+  # OUTPUTS
+  # loglik_gr: the log likelihood evaluated at x. (1 x 1)
+  #================================================================================
+  xi <- exp( RM %*% nu )
+  beta <- exp( RM %*% kappa )
+  # by specification of xi and beta we have xi, beta > 0, the derivatives are given by:
+  grad_loglik_nu <- t(1/xi*log(1 + xi/beta * x) - (xi + 1) * x/(beta + xi*x))%*%RM
+  grad_loglik_kappa <- t( (xi + 1) * x / (beta + xi * x) - 1 )%*%RM
+  loglik_gr <- c(grad_loglik_nu, grad_loglik_kappa)
+  return(loglik_gr)
+}
+
+
+CPOT_fit <- function(x, u, RM, IID.covariates = TRUE){
+  #================================================================================
+  # A function which fits the C-POT model to the sample x above the specified 
+  # threshold u with covariates RM. The MLE estimators for psi, nu and kappa are 
+  # computed. If IID.covariates = TRUE (default) the asymptotic standard errors 
+  # for the parameters are computed, along with the asymptotic variance covariance
+  # matrix for the nu, kappa MLEs
+  #
+  # INPUTS
+  # x: the data sample. (n x 1)
+  # RM: the covariates matrix (x[i] will be "regressed" on RM[i,]). (n x p)
+  # u: the threshold u above which to fit the GPD distribution. (1 x 1)
+  # IID.covariates: logical indicating whether the covariates can be treated as IID.
+  #
+  # OUTPUTS
+  # CPOT_fit: a list with named components:
+  #           pars: a dataframe with columns psi, nu, kappa corresponding to the 
+  #                 compute MLEs. (p x 3)
+  #           pars_sd: a dataframe with columns psi_se, nu_se, kappa_se corresponding 
+  #                    to the asymptotic standard errors of the MLEs when covariates
+  #                    are IID. (p x 3)
+  #           nukappa_varcov: asymptotic variance covariance matrix for the nu and 
+  #                           kappa MLEs when the covariates are IID. (2p x 2p)
+  #================================================================================
+  n <- length(x)
+  p <- ncol(RM)
+  
+  # if there are not enough exceedances to fit a GPD distribution return error
+  if(sum(x>u) <= 2) stop("Too few exceedances: lower threshold u")
+  
+  # compute MLE for psi using glm function
+  i <- as.numeric(x > u)
+  logitGLM_data <- data.frame(i, RM)
+  logitGLM <- summary(glm(i ~ 0 + ., family=binomial(link="logit"), data = logitGLM_data))
+  psi <- logitGLM$coefficients[,1]
+  
+  # compute MLE and standard error for GPD distribution on exceedances
+  nu_kappa <- optim(rep(0, (2*p)), 
+                   fn = function(pars) 
+                     - GPD_loglikelihood_CPOT(x[x>u] - u, RM[(x>u),], pars[1:p], 
+                                              pars[(p+1):(2*p)]),
+                   gr = function(pars) 
+                     - GPD_loglikelihood_CPOT_gr(x[x>u] - u, RM[(x>u),], pars[1:p],
+                                                 pars[(p+1):(2*p)]))
+  nu <- nu_kappa$par[1:p]
+  kappa <- nu_kappa$par[(p+1):(2*p)]
+  
+  # if the regressors RM are IID compute the analytic asymptotic standard errors
+  if(IID.covariates){
+    # for psi
+    psi_se <- logitGLM$coefficients[,2]
+    
+    # for nu, kappa
+    xi <- exp( RM %*% nu)
+    J <- 0
+    for(t in which(x>u)){
+      M <- matrix(rep(0, (2*p)^2), nrow = (2*p))
+      M[1:p, 1:p] <- 2 * xi[t]^2 * RM[t,]%*%t(RM[t,])
+      M[1:p, (p+1): (2*p)] <- xi[t] * RM[t,]%*%t(RM[t,])
+      M[(p+1):(2*p), 1:p] <- xi[t] * RM[t,]%*%t(RM[t,])
+      M[(p+1):(2*p), (p+1):(2*p)] <- (xi[t] + 1) * RM[t,]%*%t(RM[t,])
+      M <- 1/((xi[t]+1) * (2*x[t]+1) * sum(i)) * M
+      J <- J +  M
+    }
+
+    # asymptotic sd of xi.hat, kappa.hat
+    varcov <- solve(sum(i) * J)
+    nu_se <- sqrt(diag(varcov))[1:p]
+    kappa_se <- sqrt(diag(varcov))[(p+1):(2*p)]
+  }
+  # if the covariates cannot be taken as IID
+  else{
+    # do not compute standard errors
+    psi_se <- NA
+    nu_se <- NA
+    kappa_se <- NA
+    varcov <- NA
+  }
+  
+  
+  # return results
+  return(list(pars = data.frame(psi, nu, kappa),
+              pars_se = data.frame(psi_se, nu_se, kappa_se),
+              nukappa_varcov = varcov))
+  
+}
+
+```
+
+```{r}
+CPOT_bootstrap <- function(x, u, RM, pars){
+  #================================================================================
+  # A function which creates a bootstrap resample of the data for fitted values of 
+  # the parameters psi, nu, kappa.
+  # 
+  # INPUTS
+  # x: the original data sample. (n x 1)
+  # u: the C-POT threshold. (1 x 1)
+  # RM: the C-POT covariates. (n x p)
+  # pars: the fitted parameters, a dataframe with columns psi, nu, kappa. (p x 3)
+  #
+  # OUTPUTS
+  # x_: a resample of the data via bootstrap. (n x 1)
+  #================================================================================
+  psi <- pars$psi
+  nu <- pars$nu
+  kappa <- pars$kappa
+  
+  # fitted parameters
+  phi <- exp( RM%*%psi )/(1 + exp( RM%*%psi ))
+  xi <- exp( RM%*%nu )
+  beta <- exp( RM%*%kappa )
+  
+  # compute exceedence residuals
+  r <- 1/xi[x>u] * log(1 + xi[x>u]/beta[x>u] * (x[x>u]-u) )
+  
+  n <- nrow(RM)
+  x_ <- rep(0, n)
+  
+  # simulate exceedances
+  i <- (runif(n) < phi )
+  # if exceedance has occured simulate exceedance residual and post-blacken
+  x_[i] <- u + beta[i]/xi[i] * ( exp(xi[i]*sample(r, sum(i), replace = TRUE)) - 1)
+  # if exceedance has not occured simulate from the empirical distribution 
+  # function of values below u
+  x_[!i] <- sample(x[x<=u], sum(!i), replace = TRUE) 
+  
+  return(x_)
+}
+
+CPOT_bootstrapCIs <- function(x, u, RM, conf.level = 0.95, boot = 500){
+  #================================================================================
+  # A function which computes the bootstrap confidence intervals for the parameters 
+  # of the C-POT model with data x and covariates RM.
+  # 
+  # INPUTS
+  # x: the original data sample. (n x 1)
+  # u: the C-POT threshold. (1 x 1)
+  # RM: the C-POT covariates. (n x p)
+  # conf.level: the confidence level of the CIs. (1 x 1)
+  # boot: number of bootrap samples to use. (1 x 1)
+  #
+  # OUTPUTS
+  # pars_CIs: a list with named components:
+  #           psi, nu, kappa: dataframes containing the CIs (2 x p).
+  #================================================================================
+  # fit the model
+  pars <- CPOT_fit(x, u, RM, IID.covariates = FALSE)$pars
+  p <- ncol(RM)
+  
+  # initialise matrices to contain bootstrap samples (each row corresponds to a new sample)
+  psi_boot <- matrix(rep(0, p*boot), nrow = boot)
+  kappa_boot <- matrix(rep(0, p*boot), nrow = boot)
+  nu_boot <- matrix(rep(0, p*boot), nrow = boot)
+  
+  for(b in 1:boot){
+    # form a new bootstrap sample
+    x_ <- CPOT_bootstrap(x, u, RM, pars)
+    
+    # fit the model to the new sample
+    pars_boot <- CPOT_fit(x_, u, RM, IID.covariates = FALSE)$pars
+    
+    # retain the fitted parameters
+    psi_boot[b,] <- pars_boot$psi
+    nu_boot[b,] <- pars_boot$nu
+    kappa_boot[b,] <- pars_boot$kappa
+  }
+  
+  # probability
+  alpha <- 1 - conf.level
+  
+  # compute the confidence intervals using the empirical distribution for the parameters
+  # obtain through bootstrapping
+  psi_CI <- apply(psi_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  nu_CI <- apply(nu_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  kappa_CI <- apply(kappa_boot, 2, function(x) quantile(x, probs = c(alpha/2, 1-alpha/2)))
+  
+  # return the bootstrap confidence intervals
+  return(list(psi_CI = psi_CI, nu_CI = nu_CI, kappa_CI = kappa_CI))
+}
 ```
 
 We carry out a data simulation study to check the CPOT functions are working properly. We first simulate a sample $\boldsymbol{x} = (x_t)_{t=1}^n$ from the model-assumed data generating process with IID covariates $\boldsymbol{RM}_t$ s.t. $RM^{(1)}\sim N(0,1)$, $RM^{(2)}\sim N(0,1)$ independently. 

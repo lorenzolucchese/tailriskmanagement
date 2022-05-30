@@ -27,7 +27,7 @@ Load data for empirical analysis.
 ```{r}
 # Data 
 SPY_preprocessed_data <- read_excel(
-  "C:/Users/Lorenzo/Desktop/Imperial/M4/Thesis/SPY_1min_preprocessed_data.xlsx",
+  "data/SPY_1min_preprocessed_data.xlsx",
   col_names = FALSE, col_types = c("date", "numeric"))
 
 corrupted_dates <- c("2019-01-09", "2020-05-26", "2020-06-04", "2020-08-05", "2020-08-10",
@@ -38,7 +38,7 @@ SPY.HF <- SPY.HF[!(time(SPY.HF) %in% index(SPY.HF[corrupted_dates]))]
 
 # daily returns
 SPY.dailyreturns <- read_excel(
-  "C:/Users/Lorenzo/Desktop/Imperial/M4/Thesis/SPY_daily_log_returns.xlsx",
+  "data/SPY_daily_log_returns.xlsx",
   col_names = FALSE, col_types = c("date", "numeric"))
 SPY.dailyreturns <- xts(read.zoo(SPY.dailyreturns))
 # remove corrupted dates
@@ -1079,7 +1079,7 @@ p <- plot_grid(p_price, p_ret, nrow = 2)
 
 p
 
-save_plot("Thesis plots/identifyingjumps.jpg", p, nrow = 2, dpi = 600, limitsize = FALSE)
+save_plot("plots/identifyingjumps.jpg", p, nrow = 2, dpi = 600, limitsize = FALSE)
 ```
 
 We can hence rewrite the functions for truncated realised variance and truncated power variation with "adjusting" threshold $u$ selected with this procedure, as well as the ones for estimating the jump component of quadratic variation and the realised jump tail shape.
@@ -1260,7 +1260,7 @@ p <- ggplot(ps, aes(x = Index)) + geom_point(aes(y = ps)) + ylab("p-values") +
   theme(plot.title = element_text(hjust = 0.5))
 p
 
-save_plot("Thesis plots/jumptest.jpg", p, dpi = 600, limitsize = FALSE)
+save_plot("plots/jumptest.jpg", p, dpi = 600, limitsize = FALSE)
 ```
 
 ## HAR-EVT model
@@ -2207,7 +2207,7 @@ p <- plot_grid(p_VaR, p_xi, p_beta, nrow = 3)
 
 p
 
-save_plot("Thesis plots/CEVT_insample_tails.jpg", p, nrow = 3, dpi = 600, limitsize = FALSE)
+save_plot("plots/CEVT_insample_tails.jpg", p, nrow = 3, dpi = 600, limitsize = FALSE)
 
 cat("99%-VaR violations = ", sum(SPY.dailyreturns < - CEVT.tail$risk.meas$`0.99-VaR`),
     "/", length(SPY.dailyreturns))
@@ -2320,7 +2320,7 @@ p <- ggplot(jump.xi, aes(x = Index)) + geom_line(aes(y = xi_J)) +
   theme(plot.title = element_text(hjust = 0.5))
 p
 
-save_plot("Thesis plots/xijump.jpg", p, dpi = 600, limitsize = FALSE)
+save_plot("plots/xijump.jpg", p, dpi = 600, limitsize = FALSE)
 ```
 
 ```{r}
